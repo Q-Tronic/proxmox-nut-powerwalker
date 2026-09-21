@@ -33,6 +33,11 @@ LOGROTATE="/etc/logrotate.d/nut-powerwalker"
 LOCK="/run/lock/qtronic-nut-config.lock"
 BYPASS_STATE="/etc/nut/qtronic-bypass-state.env"
 MARKER="# managed-by: q-tronic-nut-powerwalker-installer"
+QTRONIC_VERSION="1.0.0"
+VERSION_FILE="${BASE}/VERSION"
+WATCHDOG_SERVICE="qtronic-nut-health.service"
+WATCHDOG_TIMER="qtronic-nut-health.timer"
+SELFTEST_USER="qtronic-selftest"
 
 die()  { echo "[BŁĄD] $*" >&2; exit 1; }
 warn() { echo "[UWAGA] $*" >&2; }
@@ -164,6 +169,9 @@ derive_settings_from_current() {
     POWERCYCLE_ENABLED=0
     POWERCYCLE_OFFDELAY=60
     POWERCYCLE_ONDELAY=300
+
+    UPDATE_CHANNEL="main"
+    CONFIG_BACKUP_KEEP=30
 }
 
 load_settings() {
@@ -201,6 +209,9 @@ load_settings() {
     POWERCYCLE_ENABLED="${POWERCYCLE_ENABLED:-0}"
     POWERCYCLE_OFFDELAY="${POWERCYCLE_OFFDELAY:-60}"
     POWERCYCLE_ONDELAY="${POWERCYCLE_ONDELAY:-300}"
+
+    UPDATE_CHANNEL="${UPDATE_CHANNEL:-main}"
+    CONFIG_BACKUP_KEEP="${CONFIG_BACKUP_KEEP:-30}"
 }
 
 load_creds() {
@@ -251,6 +262,10 @@ validate_settings() {
     (( POWERCYCLE_OFFDELAY >= 60 && POWERCYCLE_OFFDELAY <= 3600 ))         || die "POWERCYCLE_OFFDELAY: 60-3600 s."
     (( POWERCYCLE_ONDELAY >= 120 && POWERCYCLE_ONDELAY <= 86400 ))         || die "POWERCYCLE_ONDELAY: 120-86400 s."
     (( POWERCYCLE_ONDELAY > POWERCYCLE_OFFDELAY ))         || die "POWERCYCLE_ONDELAY musi być większy od POWERCYCLE_OFFDELAY."
+
+    [[ "${UPDATE_CHANNEL}" == "main" || "${UPDATE_CHANNEL}" == "stable" ]] || die "UPDATE_CHANNEL: main albo stable."
+    is_uint "${CONFIG_BACKUP_KEEP}" || die "CONFIG_BACKUP_KEEP nie jest liczbą."
+    (( CONFIG_BACKUP_KEEP >= 5 && CONFIG_BACKUP_KEEP <= 200 )) || die "CONFIG_BACKUP_KEEP: 5-200."
 
     if [[ "${NUT_LISTEN_IP}" != "auto" && "${NUT_LISTEN_IP}" != "off" ]]; then
         python3 - "${NUT_LISTEN_IP}" <<'PY'
@@ -318,6 +333,8 @@ save_settings_to() {
         printf 'POWERCYCLE_ENABLED=%q\n' "${POWERCYCLE_ENABLED}"
         printf 'POWERCYCLE_OFFDELAY=%q\n' "${POWERCYCLE_OFFDELAY}"
         printf 'POWERCYCLE_ONDELAY=%q\n' "${POWERCYCLE_ONDELAY}"
+        printf 'UPDATE_CHANNEL=%q\n' "${UPDATE_CHANNEL}"
+        printf 'CONFIG_BACKUP_KEEP=%q\n' "${CONFIG_BACKUP_KEEP}"
     } > "${dst}"
 }
 
@@ -342,8 +359,100 @@ require_safe_change_window() {
     fi
 }
 
+backup_list() {
+    local count=0 d last=""
+    [[ -f "${BASE}/LAST_CONFIG_BACKUP" ]] && last="$(cat "${BASE}/LAST_CONFIG_BACKUP" 2>/dev/null || true)"
+    echo "Backupy nut-config: ${CFG_BACKUPS}"
+    while IFS= read -r d; do
+        [[ -n "${d}" ]] || continue
+        count=$((count + 1))
+        printf '%3d) %s%s\n' "${count}" "$(basename "${d}")" "$([[ "${d}" == "${last}" ]] && echo '  [LAST]' || true)"
+    done < <(find "${CFG_BACKUPS}" -mindepth 1 -maxdepth 1 -type d -name 'config-*' -printf '%T@ %p\n' 2>/dev/null | sort -nr | cut -d' ' -f2-)
+    (( count > 0 )) || echo "  brak"
+}
+
+prune_backups() {
+    local keep="${1:-${CONFIG_BACKUP_KEEP:-30}}" last="" idx=0 d removed=0
+    is_uint "${keep}" || die "Liczba zachowanych backupów musi być liczbą."
+    (( keep >= 5 && keep <= 200 )) || die "Zakres backup keep: 5-200."
+    [[ -f "${BASE}/LAST_CONFIG_BACKUP" ]] && last="$(cat "${BASE}/LAST_CONFIG_BACKUP" 2>/dev/null || true)"
+    while IFS= read -r d; do
+        [[ -n "${d}" ]] || continue
+        idx=$((idx + 1))
+        if (( idx > keep )) && [[ "${d}" != "${last}" ]]; then
+            rm -rf -- "${d}"
+            removed=$((removed + 1))
+        fi
+    done < <(find "${CFG_BACKUPS}" -mindepth 1 -maxdepth 1 -type d -name 'config-*' -printf '%T@ %p\n' 2>/dev/null | sort -nr | cut -d' ' -f2-)
+    echo "Usunięto starych backupów: ${removed}; zachowuję maksymalnie ${keep} (+ LAST jeśli wymaga ochrony)."
+}
+
+resolve_backup_ref() {
+    local ref="${1:-LAST}" d
+    if [[ "${ref}" == "LAST" || "${ref}" == "last" ]]; then
+        [[ -f "${BASE}/LAST_CONFIG_BACKUP" ]] || return 1
+        d="$(cat "${BASE}/LAST_CONFIG_BACKUP")"
+    else
+        [[ "${ref}" != */* && "${ref}" == config-* ]] || return 1
+        d="${CFG_BACKUPS}/${ref}"
+    fi
+    [[ -d "${d}" ]] || return 1
+    printf '%s\n' "${d}"
+}
+
+backup_restore_cmd() {
+    local ref="${1:-LAST}" target safety target_powercycle=0 rollback_ok=1
+    require_normal_mode
+    load_settings
+    load_creds
+    require_safe_change_window
+    target="$(resolve_backup_ref "${ref}")" || die "Nie znaleziono backupu: ${ref}. Użyj: nut-config backup list"
+
+    if grep -Eq '^POWERCYCLE_ENABLED=(1|\?1)$' "${target}/etc__nut__qtronic-settings.env" 2>/dev/null; then
+        target_powercycle=1
+
+        # Backup z aktywnym power-cycle może zawierać upsmon.conf wskazujący wrapper.
+        # Instalujemy fail-closed runtime JESZCZE PRZED restore, aby nie powstało
+        # nawet krótkie okno z SHUTDOWNCMD wskazującym nieistniejący plik.
+        powercycle_probe 1 || die "Wybrany backup ma power-cycle=ON, ale aktualny UPS nie przechodzi capability gate. Nie przywracam go."
+        install_powercycle_runtime
+    fi
+
+    safety="$(backup_now 1)"
+    info "Backup bezpieczeństwa przed restore: ${safety}"
+    restore_backup_dir "${target}"
+    load_settings
+
+    if (( target_powercycle == 1 )); then
+        # Restore mógł zmienić driver/VID/PID. Po restarcie sprawdzamy sprzęt ponownie
+        # i nadpisujemy capability file świeżym fingerprintem aktualnego UPS.
+        if powercycle_probe 1; then
+            install_powercycle_runtime
+            ok "Przywrócony power-cycle przeszedł świeży capability gate."
+        else
+            warn "Po restore power-cycle nie przechodzi capability gate. Cofam restore do backupu bezpieczeństwa."
+            restore_backup_dir "${safety}" || rollback_ok=0
+            load_settings
+            if [[ "${POWERCYCLE_ENABLED}" == "1" ]]; then
+                if powercycle_probe 1; then
+                    install_powercycle_runtime
+                else
+                    remove_powercycle_runtime
+                    rollback_ok=0
+                fi
+            else
+                remove_powercycle_runtime
+            fi
+            (( rollback_ok == 1 )) || warn "Rollback bezpieczeństwa wymaga ręcznej kontroli: nut-config doctor ; nut-report"
+            return 12
+        fi
+    else
+        remove_powercycle_runtime
+    fi
+}
+
 backup_now() {
-    local d
+    local skip_prune="${1:-0}" d
     d="$(mktemp -d "${CFG_BACKUPS}/config-$(date +%Y%m%d-%H%M%S)-XXXXXX")"
     chmod 0700 "${d}"
 
@@ -370,6 +479,9 @@ backup_now() {
 
     printf '%s\n' "${d}" > "${BASE}/LAST_CONFIG_BACKUP"
     chmod 0600 "${BASE}/LAST_CONFIG_BACKUP"
+    if [[ "${skip_prune}" != "1" ]]; then
+        prune_backups "${CONFIG_BACKUP_KEEP:-30}" >/dev/null 2>&1 || true
+    fi
     echo "${d}"
 }
 
@@ -807,6 +919,137 @@ EOF_HA
     ln -sf "${INSTALL_DIR}/nut-ha-info.sh" /usr/local/sbin/nut-ha-info
 }
 
+install_report_helper() {
+    cat > "${INSTALL_DIR}/nut-report.sh" <<'EOF_REPORT'
+#!/usr/bin/env bash
+set -u
+umask 077
+SETTINGS="/etc/nut/qtronic-settings.env"
+BASE="/root/nut-powerwalker"
+OUTDIR="${BASE}/reports"
+LOG_DIR="/var/log/nut-powerwalker"
+mkdir -p "${OUTDIR}"
+chmod 0700 "${OUTDIR}"
+[[ -r "${SETTINGS}" ]] && source "${SETTINGS}"
+UPS_NAME="${UPS_NAME:-powerwalker}"
+NUT_PORT="${NUT_PORT:-3493}"
+MODE="${1:-private}"
+case "${MODE}" in
+    private|--private|'') MODE=private ;;
+    public|--public) MODE=public ;;
+    *) echo "Użycie: nut-report [--public]" >&2; exit 2 ;;
+esac
+TS="$(date +%Y%m%d-%H%M%S)"
+PRIVATE="${OUTDIR}/nut-report-${TS}.txt"
+PUBLIC="${OUTDIR}/nut-report-public-${TS}.txt"
+section() { echo; echo "============================================================"; echo "### $1"; echo "============================================================"; }
+{
+    echo "Q-Tronic NUT / Proxmox diagnostic report"
+    echo "Generated: $(date -Is)"
+    echo "Project version: $(cat /root/nut-powerwalker/VERSION 2>/dev/null || echo unknown)"
+    section "PROXMOX"; pveversion -v 2>&1 || true; pvecm status 2>&1 || true
+    section "SYSTEM"; hostnamectl 2>&1 || true; uname -a; cat /etc/os-release 2>/dev/null || true
+    section "NUT VERSION"; upsmon -V 2>&1 || true
+    section "NETWORK"; ip -brief addr 2>&1 || true; ip route 2>&1 || true; ss -lntp 2>&1 | grep -E ":(${NUT_PORT}|3493)\\b" || true
+    section "USB"; lsusb 2>&1 || true
+    section "NUT-SCANNER USB"; timeout 30s nut-scanner -U 2>&1 || true
+    for f in /etc/nut/ups.conf /etc/nut/upsd.conf /etc/nut/upssched.conf; do section "${f}"; cat "${f}" 2>&1 || true; done
+    section "/etc/nut/upsmon.conf - HASŁO UKRYTE"
+    sed -E 's#^(MONITOR[[:space:]]+[^[:space:]]+[[:space:]]+[0-9]+[[:space:]]+[^[:space:]]+)[[:space:]]+[^[:space:]]+([[:space:]]+(primary|master).*)#\\1 ***REDACTED***\\2#' /etc/nut/upsmon.conf 2>&1 || true
+    section "SYSTEMD"; systemctl --no-pager --type=service --all 2>&1 | grep -Ei 'nut|mqtt|qtronic' || true; systemctl --no-pager --type=timer --all 2>&1 | grep -Ei 'qtronic|nut' || true
+    for u in nut-server.service nut-monitor.service nut-mqtt.service qtronic-nut-health.timer; do section "${u}"; systemctl --no-pager --full status "${u}" 2>&1 || true; done
+    section "UPSC"; upsc "${UPS_NAME}@localhost" 2>&1 || true
+    section "UPSCMD -L"; upscmd -l "${UPS_NAME}@localhost" 2>&1 || true
+    section "UPSRW"; upsrw "${UPS_NAME}@localhost" 2>&1 || true
+    section "BYPASS"; if [[ -f /etc/nut/qtronic-bypass-state.env ]]; then sed -E 's/(BYPASS_UPS_FP=).*/\\1***REDACTED***/' /etc/nut/qtronic-bypass-state.env; else echo "inactive"; fi
+    section "EVENT LOG - LAST 100"; tail -n 100 "${LOG_DIR}/events.log" 2>&1 || true
+    section "MQTT LOG - LAST 100"; tail -n 100 "${LOG_DIR}/mqtt.log" 2>&1 || true
+    section "JOURNAL - LAST 150"; journalctl --no-pager -n 150 -u nut-server.service -u nut-monitor.service -u nut-mqtt.service -u qtronic-nut-health.service 2>&1 || true
+} > "${PRIVATE}"
+chmod 0600 "${PRIVATE}"
+if [[ "${MODE}" == "public" ]]; then
+    python3 - "${PRIVATE}" "${PUBLIC}" <<'PY_PUBLIC'
+import os, re, socket, subprocess, sys
+src, dst = sys.argv[1:]
+text = open(src, encoding="utf-8", errors="replace").read()
+secrets = set()
+for item in [socket.gethostname(), socket.getfqdn()]:
+    if item and item not in {"localhost", "localhost.localdomain"}: secrets.add(item)
+for cmd in (["hostname", "-I"], ["ip", "-o", "addr", "show"], ["ip", "-o", "link", "show"]):
+    try:
+        out = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5).stdout
+        for m in re.findall(r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f:]+(?![0-9A-Fa-f:])", out):
+            if m not in {"::1"}: secrets.add(m.strip("/"))
+        for m in re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", out):
+            if not m.startswith("127."): secrets.add(m)
+        for m in re.findall(r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b", out): secrets.add(m)
+    except Exception: pass
+for line in text.splitlines():
+    m = re.match(r"(?:device|ups)\.serial:\s*(.+)$", line, re.I)
+    if m and m.group(1).strip(): secrets.add(m.group(1).strip())
+    m = re.search(r"\biSerial\s+\d+\s+(.+)$", line)
+    if m and m.group(1).strip(): secrets.add(m.group(1).strip())
+for path in ("/root/nut-powerwalker/credentials.env", "/etc/nut/nut-mqtt.json"):
+    try:
+        raw = open(path, encoding="utf-8", errors="ignore").read()
+        for m in re.findall(r"(?i)(?:PASS|PASSWORD|HA_PASS|PRIMARY_PASS)[\"'=:\s]+([^\s\",']+)", raw):
+            if len(m) >= 4: secrets.add(m)
+    except Exception: pass
+for value in sorted(secrets, key=len, reverse=True):
+    if value: text = text.replace(value, "<REDACTED>")
+text = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", lambda m: m.group(0) if m.group(0).startswith("127.") else "<IP>", text)
+text = re.sub(r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b", "<MAC>", text)
+text = re.sub(r"(?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{1,4}:){2,}[0-9A-Fa-f:]{0,39}(?![0-9A-Fa-f:])", "<IPV6>", text)
+text = re.sub(r"(?im)^(\s*(?:Machine ID|Boot ID):\s*).+$", r"\1***REDACTED***", text)
+text = re.sub(r"(?im)^(\s*(?:serial|serialnumber)\s*[=:]\s*).+$", r"\1***REDACTED***", text)
+text = re.sub(r"(?im)^(\s*password\s*[=:]\s*).+$", r"\1***REDACTED***", text)
+text = re.sub(r"(?im)^(MONITOR\s+\S+\s+\d+\s+\S+\s+)\S+", r"\1***REDACTED***", text)
+with open(dst, "w", encoding="utf-8") as f:
+    f.write("Q-Tronic PUBLIC diagnostic report\nBEST-EFFORT REDACTION: review this file before publishing.\n\n" + text)
+os.chmod(dst, 0o600)
+PY_PUBLIC
+    echo "Raport PUBLICZNY zapisany: ${PUBLIC}"
+    echo "UWAGA: redakcja jest best-effort. Przejrzyj plik przed publikacją."
+    echo; cat "${PUBLIC}"
+else
+    echo "Raport PRYWATNY zapisany: ${PRIVATE}"
+    echo "Może zawierać IP, hostname, identyfikatory USB i serial UPS. Nie publikuj bez sprawdzenia."
+    echo; cat "${PRIVATE}"
+fi
+EOF_REPORT
+    chmod 0755 "${INSTALL_DIR}/nut-report.sh"
+    ln -sf "${INSTALL_DIR}/nut-report.sh" /usr/local/sbin/nut-report
+}
+
+install_watchdog_runtime() {
+    cat > /etc/systemd/system/qtronic-nut-health.service <<'EOF_SERVICE'
+[Unit]
+Description=Q-Tronic NUT read-only health watchdog
+After=nut-server.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/nut-config watchdog run --timer
+NoNewPrivileges=true
+PrivateTmp=true
+EOF_SERVICE
+    cat > /etc/systemd/system/qtronic-nut-health.timer <<'EOF_TIMER'
+[Unit]
+Description=Q-Tronic NUT health watchdog timer
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+EOF_TIMER
+    chmod 0644 /etc/systemd/system/qtronic-nut-health.service /etc/systemd/system/qtronic-nut-health.timer
+    systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
 install_self() {
     [[ ! -f "${BYPASS_STATE}" ]] || die "Tryb BYPASS jest aktywny. Zakończ go przez: nut-config resume — dopiero potem aktualizuj nut-config."
     command -v upsc >/dev/null 2>&1 || die "NUT nie jest jeszcze zainstalowany."
@@ -834,15 +1077,18 @@ install_self() {
     install_event_handler
     install_status_helper
     install_ha_helper
+    install_report_helper
+    install_watchdog_runtime
+    printf '%s\n' "${QTRONIC_VERSION}" > "${VERSION_FILE}"
+    chmod 0600 "${VERSION_FILE}"
 
     # Zachowana funkcja power-cycle nie jest ślepo odtwarzana.
     # Najpierw aktualny sprzęt musi ponownie przejść probe.
     if [[ "${POWERCYCLE_ENABLED:-0}" == "1" ]]; then
         current_status="$(status_now || true)"
 
-        if printf '%s
-' "${current_status}" | grep -qw OL            && ! printf '%s
-' "${current_status}" | grep -qw OB; then
+        if printf '%s\n' "${current_status}" | grep -qw OL \
+           && ! printf '%s\n' "${current_status}" | grep -qw OB; then
             if powercycle_probe 1; then
                 install_powercycle_runtime
             else
@@ -893,7 +1139,7 @@ show() {
 
     cat <<EOF_SHOW
 ============================================================
- Q-Tronic | nut-config
+ Q-Tronic | nut-config ${QTRONIC_VERSION}
 ============================================================
 UPS:
   nazwa wewnętrzna:    ${UPS_NAME}
@@ -922,9 +1168,14 @@ NUT:
   RBWARNTIME:          ${RBWARNTIME}
   NOCOMMWARNTIME:      ${NOCOMMWARNTIME}
 
-Logi:
+Logi / backup:
   rotate size:         ${LOG_ROTATE_SIZE}
   rotate count:        ${LOG_ROTATE_COUNT}
+  backup keep:         ${CONFIG_BACKUP_KEEP}
+
+Aktualizacje:
+  wersja:              ${QTRONIC_VERSION}
+  kanał:               ${UPDATE_CHANNEL}
 
 Power-cycle:
   enabled:             $([[ "${POWERCYCLE_ENABLED}" == "1" ]] && echo TAK || echo NIE)
@@ -939,6 +1190,7 @@ Usługi:
   nut-server:          $(systemctl is-active nut-server.service 2>/dev/null || true)
   nut-monitor:         $(systemctl is-active nut-monitor.service 2>/dev/null || true)
   nut-mqtt:            $(systemctl is-active nut-mqtt.service 2>/dev/null || true)
+  health-watchdog:     $(systemctl is-active qtronic-nut-health.timer 2>/dev/null || true)
 
 ups.status:            ${status:-brak danych}
 ============================================================
@@ -975,8 +1227,17 @@ set_key() {
         POLLFREQ|POLLFREQALERT|HOSTSYNC|DEADTIME|FINALDELAY|RBWARNTIME|NOCOMMWARNTIME|LOG_ROTATE_COUNT)
             printf -v "${key}" '%s' "${value}"
             ;;
-        POWERCYCLE_ENABLED|POWERCYCLE_OFFDELAY|POWERCYCLE_ONDELAY)
-            die "Użyj dedykowanej bramki: nut-config powercycle ..."
+        CONFIG_BACKUP_KEEP)
+            CONFIG_BACKUP_KEEP="${value}"
+            validate_settings
+            backup_now 1 >/dev/null
+            save_settings
+            prune_backups "${CONFIG_BACKUP_KEEP}"
+            ok "CONFIG_BACKUP_KEEP=${CONFIG_BACKUP_KEEP}; NUT nie był restartowany."
+            return 0
+            ;;
+        POWERCYCLE_ENABLED|POWERCYCLE_OFFDELAY|POWERCYCLE_ONDELAY|UPDATE_CHANNEL)
+            die "Użyj dedykowanej komendy zamiast nut-config set dla tego klucza."
             ;;
         LOG_ROTATE_SIZE)
             LOG_ROTATE_SIZE="${value}"
@@ -1858,77 +2119,215 @@ bypass_resume() {
 }
 
 
-update_project() {
+doctor_pass() { DOCTOR_PASS=$((DOCTOR_PASS + 1)); [[ "${DOCTOR_QUIET}" == "1" ]] || printf '[PASS] %s\n' "$*"; }
+doctor_info() { [[ "${DOCTOR_QUIET}" == "1" ]] || printf '[INFO] %s\n' "$*"; }
+doctor_warn() { DOCTOR_WARN=$((DOCTOR_WARN + 1)); printf '[WARN] %s\n' "$*"; }
+doctor_fail() { DOCTOR_FAIL=$((DOCTOR_FAIL + 1)); printf '[FAIL] %s\n' "$*"; }
+
+doctor_cmd() {
+    local mode="${1:-}" status raw perms count nodes hook="" cap_supported tmp_cluster
+    DOCTOR_PASS=0 DOCTOR_WARN=0 DOCTOR_FAIL=0 DOCTOR_QUIET=0
+    [[ "${mode}" == "--quiet" || "${mode}" == "--watchdog" ]] && DOCTOR_QUIET=1
+    [[ "${DOCTOR_QUIET}" == "1" ]] || echo "Q-Tronic doctor ${QTRONIC_VERSION} — tylko odczyt"
+    for c in upsc upscmd upsrw upsmon systemctl python3 jq flock; do command -v "${c}" >/dev/null 2>&1 && doctor_pass "polecenie ${c} dostępne" || doctor_fail "brak polecenia ${c}"; done
+    [[ -r "${SETTINGS}" ]] && doctor_pass "ustawienia ${SETTINGS} dostępne" || doctor_fail "brak ${SETTINGS}"
+    [[ -r "${CREDS}" ]] && doctor_pass "credentials dostępne" || doctor_fail "brak ${CREDS}"
+    for f in /etc/nut/ups.conf /etc/nut/upsd.conf /etc/nut/upsd.users /etc/nut/upsmon.conf /etc/nut/upssched.conf; do
+        if [[ -r "${f}" ]]; then grep -Fq "${MARKER}" "${f}" 2>/dev/null && doctor_pass "${f} zarządzany przez Q-Tronic" || doctor_warn "${f} bez markera Q-Tronic"; else doctor_fail "brak ${f}"; fi
+    done
+    perms="$(stat -c '%a' "${CREDS}" 2>/dev/null || true)"; [[ "${perms}" == "600" ]] && doctor_pass "credentials mode=600" || doctor_warn "credentials mode=${perms:-?}; oczekiwano 600"
+    perms="$(stat -c '%a' "${SETTINGS}" 2>/dev/null || true)"; [[ "${perms}" == "640" ]] && doctor_pass "settings mode=640" || doctor_warn "settings mode=${perms:-?}; oczekiwano 640"
+    systemctl is-active --quiet nut-server.service 2>/dev/null && doctor_pass "nut-server aktywny" || doctor_fail "nut-server nieaktywny"
+    if bypass_active; then
+        source "${BYPASS_STATE}"
+        [[ "${BYPASS_READY:-0}" == "1" ]] && doctor_pass "BYPASS aktywny i gotowy" || doctor_fail "BYPASS aktywny, ale niegotowy"
+        systemctl is-active --quiet nut-monitor.service 2>/dev/null && doctor_fail "nut-monitor działa podczas BYPASS" || doctor_pass "nut-monitor zatrzymany w BYPASS"
+        if [[ -x "${INSTALL_DIR}/qtronic-shutdown-wrapper.sh" || -e "${POWERCYCLE_FLAG}" || -x /usr/lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} || -x /lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} ]]; then doctor_fail "runtime power-cycle istnieje podczas BYPASS"; else doctor_pass "runtime power-cycle usunięty podczas BYPASS"; fi
+        doctor_info "brak komunikacji z UPS jest oczekiwany po fizycznym odłączeniu w BYPASS"
+    else
+        raw="$(upsc "$(local_target)" 2>&1 || true)"; status="$(printf '%s\n' "${raw}" | sed -n 's/^ups.status: //p' | head -n1)"
+        if [[ -z "${status}" ]]; then doctor_fail "UPS nie odpowiada przez lokalny control-plane"; else doctor_pass "UPS odpowiada: ups.status=${status}"; if printf '%s\n' "${status}" | grep -qw OL && ! printf '%s\n' "${status}" | grep -qw OB; then doctor_pass "UPS stabilnie OL"; elif printf '%s\n' "${status}" | grep -qw OB; then doctor_warn "UPS jest OB — trwa praca z baterii; nie zmieniaj konfiguracji"; else doctor_warn "nietypowy status UPS: ${status}"; fi; fi
+        systemctl is-active --quiet nut-monitor.service 2>/dev/null && doctor_pass "nut-monitor aktywny" || doctor_warn "nut-monitor nieaktywny — automatyczna ochrona hosta nie działa"
+    fi
+    if [[ "${POWERCYCLE_ENABLED}" == "1" ]]; then
+        [[ -x "${INSTALL_DIR}/qtronic-shutdown-wrapper.sh" ]] && doctor_pass "wrapper power-cycle istnieje" || doctor_fail "power-cycle enabled, ale brak wrappera"
+        [[ -x /usr/lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} ]] && hook=/usr/lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME}
+        [[ -x /lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} ]] && hook=/lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME}
+        [[ -n "${hook}" ]] && doctor_pass "late hook power-cycle istnieje" || doctor_fail "power-cycle enabled, ale brak late hooka"
+        if [[ -r "${CAPABILITY_FILE}" ]]; then cap_supported="$(jq -r '.supported // false' "${CAPABILITY_FILE}" 2>/dev/null || true)"; [[ "${cap_supported}" == "true" ]] && doctor_pass "capability file potwierdza supported=true" || doctor_fail "capability file nie potwierdza power-cycle"; else doctor_fail "power-cycle enabled, ale brak capability file"; fi
+    else doctor_pass "power-cycle aktualnie wyłączony"; fi
+    if [[ -f /etc/nut/nut-mqtt.json ]]; then systemctl is-active --quiet nut-mqtt.service 2>/dev/null && doctor_pass "MQTT skonfigurowane i aktywne" || doctor_info "MQTT skonfigurowane, ale usługa nieaktywna"; else doctor_info "MQTT nieskonfigurowane (funkcja opcjonalna)"; fi
+    tmp_cluster="$(mktemp /tmp/qtronic-pvecm.XXXXXX)"
+    if command -v pvecm >/dev/null 2>&1 && pvecm status >"${tmp_cluster}" 2>/dev/null; then
+        nodes="$(awk -F: '/^[[:space:]]*Nodes:/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "${tmp_cluster}")"
+        if [[ "${nodes}" =~ ^[0-9]+$ ]] && (( nodes > 1 )); then doctor_warn "wykryto klaster Proxmox (${nodes} węzłów): projekt chroni lokalny host; sprawdź quorum/HA"; else doctor_info "Proxmox cluster: ${nodes:-1} węzeł"; fi
+    else doctor_info "brak aktywnego klastra Proxmox lub pvecm niedostępne"; fi
+    rm -f "${tmp_cluster}"
+    count="$(find "${CFG_BACKUPS}" -mindepth 1 -maxdepth 1 -type d -name 'config-*' 2>/dev/null | wc -l)"; doctor_info "backupy nut-config: ${count}; limit=${CONFIG_BACKUP_KEEP}"
+    systemctl is-enabled --quiet "${WATCHDOG_TIMER}" 2>/dev/null && doctor_info "health watchdog: włączony" || doctor_info "health watchdog: wyłączony (opcjonalny)"
+    if (( DOCTOR_FAIL > 0 )); then printf 'WYNIK: FAIL (%d błędów, %d ostrzeżeń, %d PASS)\n' "${DOCTOR_FAIL}" "${DOCTOR_WARN}" "${DOCTOR_PASS}"; return 1; elif (( DOCTOR_WARN > 0 )); then printf 'WYNIK: READY WITH WARNINGS (%d ostrzeżeń, %d PASS)\n' "${DOCTOR_WARN}" "${DOCTOR_PASS}"; return 0; else printf 'WYNIK: SYSTEM GOTOWY (%d PASS)\n' "${DOCTOR_PASS}"; return 0; fi
+}
+
+watchdog_run() {
+    local issues=0 status msg
+    if bypass_active; then
+        if systemctl is-active --quiet nut-monitor.service 2>/dev/null; then logger -t Q-Tronic-NUT-Health "ALERT: nut-monitor aktywny podczas BYPASS"; issues=$((issues + 1)); fi
+        if [[ -x "${INSTALL_DIR}/qtronic-shutdown-wrapper.sh" || -e "${POWERCYCLE_FLAG}" || -x /usr/lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} || -x /lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} ]]; then logger -t Q-Tronic-NUT-Health "ALERT: runtime power-cycle istnieje podczas BYPASS"; issues=$((issues + 1)); fi
+    else
+        systemctl is-active --quiet nut-server.service 2>/dev/null || { logger -t Q-Tronic-NUT-Health "ALERT: nut-server nieaktywny"; issues=$((issues + 1)); }
+        status="$(status_now || true)"; [[ -n "${status}" ]] || { logger -t Q-Tronic-NUT-Health "ALERT: brak komunikacji z UPS"; issues=$((issues + 1)); }
+        systemctl is-active --quiet nut-monitor.service 2>/dev/null || { logger -t Q-Tronic-NUT-Health "ALERT: nut-monitor nieaktywny"; issues=$((issues + 1)); }
+        if [[ "${POWERCYCLE_ENABLED}" == "1" ]]; then [[ -x "${INSTALL_DIR}/qtronic-shutdown-wrapper.sh" ]] || { logger -t Q-Tronic-NUT-Health "ALERT: power-cycle enabled bez wrappera"; issues=$((issues + 1)); }; [[ -x /usr/lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} || -x /lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} ]] || { logger -t Q-Tronic-NUT-Health "ALERT: power-cycle enabled bez late hooka"; issues=$((issues + 1)); }; fi
+    fi
+    if (( issues > 0 )); then msg="Q-Tronic watchdog wykrył ${issues} problem(y). Uruchom: nut-config doctor oraz nut-logs 100"; [[ "${1:-}" == "--timer" ]] || echo "${msg}"; return 1; fi
+    [[ "${1:-}" == "--timer" ]] || echo "[OK] Watchdog: brak wykrytych niespójności."; return 0
+}
+
+watchdog_cmd() {
+    local sub="${1:-status}"
+    case "${sub}" in
+        status) systemctl --no-pager --full status "${WATCHDOG_TIMER}" 2>/dev/null || true ;;
+        enable|on) systemctl enable --now "${WATCHDOG_TIMER}"; ok "Health watchdog włączony (read-only, co ok. 5 minut)." ;;
+        disable|off) systemctl disable --now "${WATCHDOG_TIMER}" >/dev/null 2>&1 || true; ok "Health watchdog wyłączony." ;;
+        run) watchdog_run "${2:-}" ;;
+        *) die "nut-config watchdog status|enable|disable|run" ;;
+    esac
+}
+
+guided_outage_test() {
+    require_normal_mode; load_settings
+    local raw status charge max_ob=20 waited=0 answer
+    [[ "${POWERCYCLE_ENABLED}" == "0" ]] || die "Najpierw wyłącz power-cycle: nut-config powercycle disable"
+    systemctl is-active --quiet nut-monitor.service 2>/dev/null || die "nut-monitor musi być aktywny do testu."
+    raw="$(upsc "$(local_target)" 2>&1 || true)"; status="$(printf '%s\n' "${raw}" | sed -n 's/^ups.status: //p' | head -n1)"
+    [[ -n "${status}" ]] || die "UPS nie odpowiada."; printf '%s\n' "${status}" | grep -qw OL || die "Test zaczynamy wyłącznie z OL. Status: ${status}"; ! printf '%s\n' "${status}" | grep -Eqw 'OB|LB' || die "UPS nie jest w bezpiecznym stanie: ${status}"
+    charge="$(printf '%s\n' "${raw}" | sed -n 's/^battery.charge: //p' | head -n1)"
+    if [[ "${charge}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then python3 - "${charge}" <<'PY_CHARGE30' || die "Bateria ma mniej niż 30%. Naładuj UPS przed testem."
+import sys
+raise SystemExit(0 if float(sys.argv[1]) >= 30 else 1)
+PY_CHARGE30
+    fi
+    if [[ "${TIMED_SHUTDOWN}" == "1" ]]; then (( SHUTDOWN_DELAY >= 45 )) || die "Shutdown delay=${SHUTDOWN_DELAY}s jest za krótki do prowadzonego testu. Ustaw co najmniej 45 s."; (( max_ob < SHUTDOWN_DELAY - 15 )) || max_ob=$((SHUTDOWN_DELAY - 15)); fi
+    (( max_ob >= 10 )) || die "Za mały margines czasu do bezpiecznego testu."
+    echo "============================================================"; echo " PROWADZONY TEST OL -> OB -> OL (bez power-cycle)"; echo "============================================================"; echo "NIE odłączaj kabla serwera od UPS. Odłączysz tylko wejście 230 V UPS."; echo "Po wykryciu OB natychmiast przywróć 230 V. Okno kreatora: ${max_ob}s."; read -r -p "Wpisz TEST aby rozpocząć: " answer; [[ "${answer}" == "TEST" ]] || { echo "Anulowano."; return 0; }
+    echo "Odłącz teraz wejście 230 V UPS. Czekam maks. 120 s na OB..."; while (( waited < 120 )); do status="$(status_now || true)"; if printf '%s\n' "${status}" | grep -qw OB; then break; fi; sleep 1; waited=$((waited + 1)); done; printf '%s\n' "${status}" | grep -qw OB || die "Nie wykryto OB w 120 s. Przywróć zasilanie i sprawdź nut-status."
+    echo "[OK] Wykryto OB. PODŁĄCZ TERAZ 230 V UPS Z POWROTEM."; waited=0
+    while (( waited < max_ob )); do status="$(status_now || true)"; if printf '%s\n' "${status}" | grep -qw OL && ! printf '%s\n' "${status}" | grep -qw OB; then break; fi; printf '%s\n' "${status}" | grep -qw LB && warn "LOWBATT — przywróć 230 V NATYCHMIAST."; printf '\rCzekam na OL... %2d/%2d s ' "$((waited + 1))" "${max_ob}"; sleep 1; waited=$((waited + 1)); done; echo
+    if ! printf '%s\n' "${status}" | grep -qw OL || printf '%s\n' "${status}" | grep -qw OB; then warn "Nie wykryto OL w bezpiecznym oknie. Przywróć 230 V natychmiast; rzeczywisty timer NUT może nadal działać."; return 3; fi
+    echo "[OK] OL wróciło. Czekam 5 s..."; sleep 5; status="$(status_now || true)"; if printf '%s\n' "${status}" | grep -qw OL && ! printf '%s\n' "${status}" | grep -qw OB; then ok "Test OL -> OB -> OL zakończony poprawnie."; tail -n 20 "${LOG_DIR}/events.log" 2>/dev/null || true; return 0; fi; die "Po stabilizacji UPS nie jest OL: ${status:-brak}"
+}
+
+selftest_probe() {
+    require_normal_mode
+    local cmds status; status="$(status_now || true)"; [[ -n "${status}" ]] || die "UPS nie odpowiada."; printf '%s\n' "${status}" | grep -qw OL || die "Self-test probe wykonuj przy OL. Status: ${status}"; cmds="$(upscmd -l "$(local_target)" 2>&1 || true)"
+    echo "Q-Tronic self-test probe — tylko odczyt"; for c in test.battery.start.quick test.battery.start.deep test.battery.start test.battery.stop; do if printf '%s\n' "${cmds}" | grep -Eq "^${c}([[:space:]]|$)"; then echo "[TAK] ${c}"; else echo "[NIE] ${c}"; fi; done; echo "Samo probe nie uruchamia testu baterii."
+}
+
+selftest_quick() {
     require_normal_mode
     load_settings
-    load_creds
+    [[ "${1:-}" == "TESTUJ" ]] || die "Aby świadomie uruchomić test: nut-config selftest quick TESTUJ"
+    [[ "${POWERCYCLE_ENABLED}" == "0" ]] || die "Na pierwszy self-test wyłącz power-cycle."
+    command -v openssl >/dev/null 2>&1 || die "Brak openssl."
+    upscmd -h 2>&1 | grep -Eq '(^|[[:space:]])-A([[:space:]]|,|$)' || die "Ta wersja upscmd nie obsługuje bezpiecznego authconf (-A)."
 
-    command -v curl >/dev/null 2>&1 || die "Brak curl. Zainstaluj pakiet curl i spróbuj ponownie."
-
-    local status backup tmp url rc
-    status="$(status_now || true)"
-    [[ -n "${status}" ]] || die "Nie aktualizuję bez komunikacji z UPS. Najpierw przywróć UPS i sprawdź: nut-status"
-    printf '%s\n' "${status}" | grep -qw OL || die "Aktualizacja wymaga stabilnego OL. Aktualny status: ${status}"
-    ! printf '%s\n' "${status}" | grep -qw OB || die "UPS raportuje OB. Nie aktualizuję podczas pracy na baterii."
+    local raw status charge cmds pass auth original backup
+    raw="$(upsc "$(local_target)" 2>&1 || true)"
+    status="$(printf '%s\n' "${raw}" | sed -n 's/^ups.status: //p' | head -n1)"
+    [[ -n "${status}" ]] || die "UPS nie odpowiada."
+    printf '%s\n' "${status}" | grep -qw OL || die "Quick self-test wymaga OL. Status: ${status}"
+    ! printf '%s\n' "${status}" | grep -Eqw 'OB|LB' || die "Niebezpieczny status: ${status}"
+    charge="$(printf '%s\n' "${raw}" | sed -n 's/^battery.charge: //p' | head -n1)"
+    if [[ "${charge}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        python3 - "${charge}" <<'PY_CHARGE50' || die "Bateria ma mniej niż 50%."
+import sys
+raise SystemExit(0 if float(sys.argv[1]) >= 50 else 1)
+PY_CHARGE50
+    fi
+    cmds="$(upscmd -l "$(local_target)" 2>&1 || true)"
+    printf '%s\n' "${cmds}" | grep -Eq '^test\.battery\.start\.quick([[:space:]]|$)' || die "UPS nie raportuje test.battery.start.quick."
 
     backup="$(backup_now)"
-    tmp="$(mktemp /tmp/qtronic-update-install.XXXXXX.sh)"
-    chmod 0700 "${tmp}"
-    url="https://raw.githubusercontent.com/Q-Tronic/proxmox-nut-powerwalker/main/install.sh"
+    original="$(mktemp /tmp/qtronic-upsusers.XXXXXX)"
+    auth="$(mktemp /tmp/qtronic-nutauth.XXXXXX)"
+    cp -a /etc/nut/upsd.users "${original}"
+    pass="$(openssl rand -hex 24)"
 
-    info "Backup przed aktualizacją: ${backup}"
-    info "Pobieram aktualny bootstrap z oficjalnego repo Q-Tronic..."
-    if ! curl \
-        --fail \
-        --silent \
-        --show-error \
-        --location \
-        --retry 3 \
-        --retry-delay 2 \
-        --connect-timeout 10 \
-        --max-time 120 \
-        --proto '=https' \
-        --tlsv1.2 \
-        "${url}" -o "${tmp}"; then
-        rm -f "${tmp}"
-        die "Nie udało się pobrać instalatora aktualizacji. Obecna instalacja nie została przez ten krok zmieniona."
-    fi
+    # Cała operacja wykonuje się w subshellu z cleanup na EXIT/INT/TERM.
+    # Dzięki temu tymczasowe konto nie powinno pozostać po Ctrl+C ani błędzie.
+    (
+        set +e
+        cleanup_selftest() {
+            cp -a "${original}" /etc/nut/upsd.users 2>/dev/null || true
+            chown root:nut /etc/nut/upsd.users 2>/dev/null || true
+            chmod 0640 /etc/nut/upsd.users 2>/dev/null || true
+            rm -f "${auth}" "${original}" 2>/dev/null || true
+            systemctl restart nut-server.service >/dev/null 2>&1 || true
+        }
+        trap cleanup_selftest EXIT INT TERM HUP
 
-    [[ -s "${tmp}" ]] || { rm -f "${tmp}"; die "Pobrany install.sh jest pusty."; }
-    head -n1 "${tmp}" | grep -Fq '#!/usr/bin/env bash' \
-        || { rm -f "${tmp}"; die "Pobrany plik nie wygląda jak skrypt Bash."; }
-    grep -Fq 'REPO_OWNER="Q-Tronic"' "${tmp}" \
-        || { rm -f "${tmp}"; die "Pobrany install.sh nie zawiera oczekiwanego repozytorium Q-Tronic."; }
-    grep -Fq 'REPO_NAME="proxmox-nut-powerwalker"' "${tmp}" \
-        || { rm -f "${tmp}"; die "Pobrany install.sh nie zawiera oczekiwanej nazwy projektu."; }
-    bash -n "${tmp}" \
-        || { rm -f "${tmp}"; die "Pobrany install.sh nie przeszedł bash -n."; }
+        {
+            cat "${original}"
+            echo
+            echo "[${SELFTEST_USER}]"
+            echo "    password = ${pass}"
+            echo "    instcmds = test.battery.start.quick"
+            printf '%s\n' "${cmds}" | grep -Eq '^test\.battery\.stop([[:space:]]|$)' && echo "    instcmds = test.battery.stop"
+        } > /etc/nut/upsd.users
+        chown root:nut /etc/nut/upsd.users
+        chmod 0640 /etc/nut/upsd.users
+        cat > "${auth}" <<EOF_AUTH
+[${SELFTEST_USER}@localhost:3493]
+    PASS = "${pass}"
+EOF_AUTH
+        chmod 0600 "${auth}"
 
-    echo
-    echo "Aktualizacja uruchomi oficjalny install.sh z gałęzi main."
-    echo "Istniejące dane dostępowe i ustawienia Q-Tronic mają zostać zachowane,"
-    echo "a konfiguracja po aktualizacji zostanie ponownie zweryfikowana przez instalator."
-    echo
-
-    set +e
-    bash "${tmp}"
-    rc=$?
-    set -e
-    rm -f "${tmp}"
-
+        systemctl restart nut-server.service || exit 40
+        sleep 1
+        upscmd -A "${auth}" "$(local_target)" test.battery.start.quick
+        rc=$?
+        if (( rc == 0 )); then
+            echo "[OK] Quick self-test został przyjęty przez upsd/driver."
+            echo "Nie gwarantuje to fizycznego wyniku firmware. Obserwuj nut-watch i nut-logs 100."
+        fi
+        exit "${rc}"
+    )
+    local rc=$?
     if (( rc != 0 )); then
-        warn "Aktualizacja zakończyła się kodem ${rc}."
-        echo "Backup sprzed aktualizacji nut-config: ${backup}"
-        echo "Diagnostyka: nut-report"
-        echo "Pełny rollback instalatora (jeśli potrzebny): nut-rollback"
+        warn "Quick self-test zakończył się kodem ${rc}. Tymczasowe konto zostało posprzątane. Backup: ${backup}"
         return "${rc}"
     fi
+    echo "Tymczasowe konto z instcmds zostało usunięte. Backup: ${backup}"
+}
 
-    ok "Aktualizacja zakończona."
-    echo "Po wyjściu z bieżącego polecenia sprawdź:"
-    echo "  nut-status"
-    echo "  nut-config show"
-    echo "  nut-config powercycle status"
+selftest_cmd() { local sub="${1:-probe}"; shift || true; case "${sub}" in probe|status) selftest_probe ;; quick) selftest_quick "${1:-}" ;; *) die "nut-config selftest probe|quick TESTUJ" ;; esac; }
+
+version_cmd() { load_settings; echo "Q-Tronic Proxmox NUT PowerWalker"; echo "Wersja lokalna: ${QTRONIC_VERSION}"; echo "Kanał update:   ${UPDATE_CHANNEL}"; echo "Repo:           Q-Tronic/proxmox-nut-powerwalker"; }
+
+fetch_update_target() {
+    local channel="${UPDATE_CHANNEL}" version ref json
+    if [[ "${channel}" == "main" ]]; then ref="main"; version="$(curl --fail --silent --show-error --location --connect-timeout 10 --max-time 30 --proto '=https' --tlsv1.2 "https://raw.githubusercontent.com/Q-Tronic/proxmox-nut-powerwalker/main/VERSION" 2>/dev/null | tr -d '\r\n' || true)"; [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]] || version="unknown"; else json="$(curl --fail --silent --show-error --location --connect-timeout 10 --max-time 30 --proto '=https' --tlsv1.2 "https://api.github.com/repos/Q-Tronic/proxmox-nut-powerwalker/releases/latest" 2>/dev/null || true)"; ref="$(printf '%s' "${json}" | jq -r '.tag_name // empty' 2>/dev/null || true)"; [[ -n "${ref}" ]] || die "Kanał stable nie ma jeszcze GitHub Release. Użyj: nut-config update channel main"; version="${ref#v}"; fi
+    printf '%s\t%s\n' "${version}" "${ref}"
+}
+
+update_check() { command -v curl >/dev/null 2>&1 || die "Brak curl."; local remote ref; IFS=$'\t' read -r remote ref < <(fetch_update_target); version_cmd; echo "Wersja zdalna:  ${remote}"; echo "Ref:            ${ref}"; if [[ "${remote}" == "${QTRONIC_VERSION}" ]]; then echo "Status:         numer wersji jest aktualny."; [[ "${UPDATE_CHANNEL}" == "main" ]] && echo "Uwaga: main może zawierać nowsze commity bez zmiany VERSION."; else echo "Status:         dostępna jest inna wersja/ref."; fi; }
+update_channel_set() { local value="${1:-}" backup; [[ "${value}" == "main" || "${value}" == "stable" ]] || die "Kanał: main albo stable."; backup="$(backup_now)"; UPDATE_CHANNEL="${value}"; validate_settings; save_settings; ok "Kanał aktualizacji ustawiony: ${UPDATE_CHANNEL}. NUT nie był restartowany. Backup: ${backup}"; }
+
+update_project() {
+    local arg="${1:-}" force=0 remote ref status backup tmp url rc
+    load_settings
+    case "${arg}" in --check|check) update_check; return 0 ;; --force|force) force=1 ;; '') ;; *) die "Użycie: nut-config update [--check|--force] albo nut-config update channel main|stable" ;; esac
+    require_normal_mode; load_creds; command -v curl >/dev/null 2>&1 || die "Brak curl."
+    status="$(status_now || true)"; [[ -n "${status}" ]] || die "Nie aktualizuję bez komunikacji z UPS."; printf '%s\n' "${status}" | grep -qw OL || die "Aktualizacja wymaga OL. Status: ${status}"; ! printf '%s\n' "${status}" | grep -qw OB || die "UPS raportuje OB."
+    IFS=$'\t' read -r remote ref < <(fetch_update_target)
+    if [[ "${UPDATE_CHANNEL}" == "stable" && "${remote}" == "${QTRONIC_VERSION}" && "${force}" != "1" ]]; then ok "Masz już stable ${QTRONIC_VERSION}."; echo "Reinstall: nut-config update --force"; return 0; fi
+    backup="$(backup_now)"; tmp="$(mktemp /tmp/qtronic-update-install.XXXXXX.sh)"; chmod 0700 "${tmp}"; url="https://raw.githubusercontent.com/Q-Tronic/proxmox-nut-powerwalker/${ref}/install.sh"
+    info "Lokalna=${QTRONIC_VERSION}; kanał=${UPDATE_CHANNEL}; cel=${remote} (${ref})"; info "Backup: ${backup}"
+    if ! curl --fail --silent --show-error --location --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 120 --proto '=https' --tlsv1.2 "${url}" -o "${tmp}"; then rm -f "${tmp}"; die "Nie udało się pobrać instalatora."; fi
+    [[ -s "${tmp}" ]] || { rm -f "${tmp}"; die "Pusty install.sh."; }; head -n1 "${tmp}" | grep -Fq '#!/usr/bin/env bash' || { rm -f "${tmp}"; die "Nie wygląda jak Bash."; }; grep -Fq 'REPO_OWNER="Q-Tronic"' "${tmp}" || { rm -f "${tmp}"; die "Złe repo."; }; grep -Fq 'REPO_NAME="proxmox-nut-powerwalker"' "${tmp}" || { rm -f "${tmp}"; die "Zły projekt."; }; bash -n "${tmp}" || { rm -f "${tmp}"; die "install.sh nie przechodzi bash -n."; }
+    set +e; QTRONIC_REF="${ref}" bash "${tmp}"; rc=$?; set -e; rm -f "${tmp}"
+    if (( rc != 0 )); then warn "Aktualizacja kod ${rc}."; echo "Backup: ${backup}"; echo "Diagnostyka: nut-config doctor ; nut-report --public"; return "${rc}"; fi
+    ok "Aktualizacja zakończona."; echo "Sprawdź: nut-config version ; nut-config doctor ; nut-status"
 }
 
 help_text() {
@@ -2015,9 +2414,54 @@ SZYBKI START
       stanu i po zmianie sprawdza stabilne OL. Przy błędzie wykonuje rollback.
       Blokowane w BYPASS, bo planowo odłączony UPS nie powinien być restartowany/sondowany.
 
+DIAGNOSTYKA / JAKOŚĆ
+  nut-config doctor
+      Kompletny read-only przegląd instalacji PASS/WARN/FAIL. Sprawdza pliki, prawa,
+      usługi, komunikację, OL/OB, BYPASS, power-cycle, MQTT, backupy i klaster Proxmox.
+
+  nut-config test
+      Prowadzony test OL -> OB -> OL. Nie steruje 230 V: prowadzi użytkownika i pilnuje
+      bezpiecznego okna czasowego. Power-cycle musi być wyłączony.
+
+  nut-report --public
+  nut-config report --public
+      Tworzy kopię z best-effort redakcją hostname, IP, MAC, haseł i serialu UPS.
+      Zawsze przejrzyj wynik przed publikacją.
+
+SELF-TEST BATERII — WARUNKOWY
+  nut-config selftest probe
+      Read-only: sprawdza raportowane komendy test.battery.*.
+
+  nut-config selftest quick TESTUJ
+      Quick test tylko przy OL, baterii >=50% (jeśli raportowana), power-cycle OFF i jawnej
+      komendzie urządzenia. Używa chwilowego konta NUT o minimalnym instcmds i usuwa je po komendzie.
+
+WATCHDOG READ-ONLY
+  nut-config watchdog status
+  nut-config watchdog enable
+  nut-config watchdog disable
+  nut-config watchdog run
+      Opcjonalny timer co ok. 5 min. Niczego nie naprawia; tylko loguje niespójności.
+
+BACKUPY
+  nut-config backup create
+  nut-config backup list
+  nut-config backup restore LAST
+  nut-config backup restore config-...
+  nut-config backup prune [N]
+  nut-config set CONFIG_BACKUP_KEEP 30
+      Restore tworzy backup bezpieczeństwa. Domyślny limit to 30, zakres 5-200.
+
+WERSJONOWANIE
+  nut-config version
+  nut-config update --check
+  nut-config update channel main
+  nut-config update channel stable
+      stable używa najnowszego GitHub Release; main bieżącej gałęzi main.
+
 AKTUALIZACJA
   nut-config update
-      Zalecany sposób aktualizacji projektu z gałęzi main. Komenda:
+      Aktualizuje z wybranego kanału (main albo stable). Komenda:
       - odmawia pracy podczas BYPASS;
       - wymaga komunikacji z UPS i stabilnego OL;
       - tworzy dodatkowy backup konfiguracji przed aktualizacją;
@@ -2028,7 +2472,7 @@ AKTUALIZACJA
       - po aktualizacji główny instalator ponownie waliduje UPS i stos NUT.
       Jeśli aktualizacja zwróci błąd, nie ignoruj go: uruchom nut-report i sprawdź backup.
 
-      Alternatywa ręczna (robi to samo z publicznego main):
+      Alternatywa ręczna dla main:
         bash <(curl -fsSL https://raw.githubusercontent.com/Q-Tronic/proxmox-nut-powerwalker/main/install.sh)
 
 SHUTDOWN
@@ -2365,180 +2809,24 @@ menu_powercycle() {
 menu() {
     while true; do
         menu_header
-
         if bypass_active; then
-            echo "BYPASS jest aktywny — menu ogranicza zmiany do bezpiecznych operacji."
-            echo "1) Pokaż status BYPASS"
-            echo "2) Zakończ BYPASS po ponownym podłączeniu UPS"
-            echo "3) Pokaż ogólny status/ustawienia"
-            echo "4) Pokaż ostatnie 100 linii logów"
-            echo "0) Wyjście"
-            read -r -p "Wybór: " choice
-            case "${choice}" in
-                1) bypass_status; menu_pause ;;
-                2)
-                    if menu_confirm_word PRZYWROC "UPS musi być ponownie podłączony; resume wymaga stabilnego OL i przywraca zapamiętane usługi."; then bypass_resume; else echo "Anulowano."; fi
-                    menu_pause
-                    ;;
-                3) show; menu_pause ;;
-                4) /usr/local/sbin/nut-logs 100; menu_pause ;;
-                0) exit 0 ;;
-                *) echo "Nieprawidłowy wybór."; menu_pause ;;
-            esac
-            continue
+            echo "BYPASS aktywny — tylko bezpieczne operacje."; echo "1) Status BYPASS"; echo "2) Resume"; echo "3) Status/ustawienia"; echo "4) Doctor"; echo "5) Logi"; echo "6) Wersja/update check"; echo "0) Wyjście"; read -r -p "Wybór: " choice
+            case "${choice}" in 1) bypass_status; menu_pause ;; 2) if menu_confirm_word PRZYWROC "UPS musi być podłączony i OL."; then bypass_resume; else echo "Anulowano."; fi; menu_pause ;; 3) show; menu_pause ;; 4) doctor_cmd || true; menu_pause ;; 5) /usr/local/sbin/nut-logs 100; menu_pause ;; 6) version_cmd; echo; update_check || true; menu_pause ;; 0) exit 0 ;; *) echo "Nieprawidłowy wybór."; menu_pause ;; esac; continue
         fi
-
-        echo "1)  [ODCZYT] Status i wszystkie ustawienia"
-        echo "2)  [OCHRONA] Shutdown: timer / delay / LOWBATT"
-        echo "3)  [SPRZĘT] UPS / USB: podgląd lub auto-detect"
-        echo "4)  [SIEĆ] LAN / Home Assistant"
-        echo "5)  [OCHRONA] Monitor NUT"
-        echo "6)  [PROCEDURA] BYPASS — bezpieczne odłączenie/powrót UPS"
-        echo "7)  [ZAAWANSOWANE] Power-cycle UPS"
-        echo "8)  [OPCJONALNE] MQTT"
-        echo "9)  [ODCZYT] Diagnostyka / logi / test guide"
-        echo "10) [ODZYSKIWANIE] Backup / rollback"
-        echo "11) [AKTUALIZACJA] Pobierz i zainstaluj najnowszą wersję"
-        echo "12) [POMOC] Opis wszystkich komend"
-        echo "0)  Wyjście"
-        read -r -p "Wybór: " choice
-
+        echo "1)  [ODCZYT] Status i ustawienia"; echo "2)  [OCHRONA] Shutdown"; echo "3)  [SPRZĘT] UPS / USB"; echo "4)  [SIEĆ] LAN / HA"; echo "5)  [OCHRONA] Monitor NUT"; echo "6)  [PROCEDURA] BYPASS"; echo "7)  [ZAAWANSOWANE] Power-cycle"; echo "8)  [TEST] Self-test baterii"; echo "9)  [OPCJONALNE] MQTT"; echo "10) [DIAGNOSTYKA] Doctor / test zaniku / raport"; echo "11) [ODZYSKIWANIE] Backupy"; echo "12) [WATCHDOG] Read-only"; echo "13) [AKTUALIZACJA] Wersja / kanał / update"; echo "14) [POMOC] Wszystkie komendy"; echo "0)  Wyjście"; read -r -p "Wybór: " choice
         case "${choice}" in
-            1) show; menu_pause ;;
-            2) menu_shutdown ;;
-            3)
-                echo
-                echo "1) Pokaż ustawienia UPS/USB"
-                echo "2) Auto-detect przez nut-scanner"
-                echo "0) Anuluj"
-                read -r -p "Wybór: " v
-                case "${v}" in
-                    1) echo "UPS_NAME=${UPS_NAME}"; echo "UPS_DRIVER=${UPS_DRIVER}"; echo "UPS_PORT=${UPS_PORT}"; echo "UPS_VENDORID=${UPS_VENDORID}"; echo "UPS_PRODUCTID=${UPS_PRODUCTID}"; echo "UPS_SUBDRIVER=${UPS_SUBDRIVER}" ;;
-                    2)
-                        echo "Auto-detect może zmienić driver/VID/PID/subdriver i zrestartować NUT."
-                        if menu_confirm_word WYKRYJ "Uruchom auto-detect tylko przy stabilnym OL i podłączonym właściwym UPS."; then detect_ups; else echo "Anulowano."; fi
-                        ;;
-                    0) : ;;
-                    *) echo "Nieprawidłowy wybór." ;;
-                esac
-                menu_pause
-                ;;
-            4)
-                echo
-                echo "1) Pokaż dane Home Assistant (UWAGA: pokazuje hasło)"
-                echo "2) LAN auto"
-                echo "3) Wyłącz LAN"
-                echo "4) Ustaw konkretny IP LAN"
-                echo "5) Ustaw port LAN/HA"
-                echo "0) Anuluj"
-                read -r -p "Wybór: " v
-                case "${v}" in
-                    1)
-                        if menu_confirm_word POKAZ "Na ekranie zostanie wyświetlone HASŁO konta Home Assistant."; then /usr/local/sbin/nut-ha-info; else echo "Anulowano."; fi
-                        ;;
-                    2) set_key NUT_LISTEN_IP auto ;;
-                    3) set_key NUT_LISTEN_IP off ;;
-                    4) read -r -p "Adres IPv4/IPv6 hosta: " ip; set_key NUT_LISTEN_IP "${ip}" ;;
-                    5) read -r -p "Port [1-65535]: " port; set_key NUT_PORT "${port}" ;;
-                    0) : ;;
-                    *) echo "Nieprawidłowy wybór." ;;
-                esac
-                menu_pause
-                ;;
-            5)
-                echo
-                echo "1) Status monitora"
-                echo "2) Włącz monitor (wymaga OL)"
-                echo "3) Wyłącz monitor (wyłącza automatyczną ochronę)"
-                echo "0) Anuluj"
-                read -r -p "Wybór: " v
-                case "${v}" in
-                    1) monitor_cmd status ;;
-                    2) monitor_cmd enable ;;
-                    3) if menu_confirm_word WYLACZ "Po wyłączeniu nut-monitor host nie reaguje automatycznie na awarię zasilania."; then monitor_cmd disable; else echo "Anulowano."; fi ;;
-                    0) : ;;
-                    *) echo "Nieprawidłowy wybór." ;;
-                esac
-                menu_pause
-                ;;
-            6) menu_bypass ;;
-            7) menu_powercycle ;;
-            8)
-                echo
-                echo "1) Status MQTT"
-                echo "2) Konfiguruj/testuj MQTT"
-                echo "3) Pokaż konfigurację bez hasła"
-                echo "4) Zmień interwał publikacji"
-                echo "5) Wyłącz MQTT"
-                echo "0) Anuluj"
-                read -r -p "Wybór: " v
-                case "${v}" in
-                    1) mqtt_cmd status ;;
-                    2) mqtt_cmd setup ;;
-                    3) mqtt_cmd show ;;
-                    4) read -r -p "Interwał [5-3600 s]: " sec; mqtt_cmd interval "${sec}" ;;
-                    5) mqtt_cmd disable ;;
-                    0) : ;;
-                    *) echo "Nieprawidłowy wybór." ;;
-                esac
-                menu_pause
-                ;;
-            9)
-                echo
-                echo "1) nut-status — szybki stan UPS"
-                echo "2) capabilities — dane/komendy/RW urządzenia"
-                echo "3) ostatnie 100 linii logów"
-                echo "4) pełny raport diagnostyczny"
-                echo "5) bezpieczna instrukcja pierwszego testu"
-                echo "0) Anuluj"
-                read -r -p "Wybór: " v
-                case "${v}" in
-                    1) /usr/local/sbin/nut-status ;;
-                    2) /usr/local/sbin/nut-capabilities ;;
-                    3) /usr/local/sbin/nut-logs 100 ;;
-                    4) /usr/local/sbin/nut-report ;;
-                    5) /usr/local/sbin/nut-test-guide ;;
-                    0) : ;;
-                    *) echo "Nieprawidłowy wybór." ;;
-                esac
-                menu_pause
-                ;;
-            10)
-                echo
-                echo "1) Utwórz backup teraz"
-                echo "2) Rollback ostatniej zmiany nut-config"
-                echo "0) Anuluj"
-                read -r -p "Wybór: " v
-                case "${v}" in
-                    1) backup_now ;;
-                    2) if menu_confirm_word PRZYWROC "Rollback zastąpi bieżące pliki NUT ostatnim backupem."; then require_normal_mode; [[ -f "${BASE}/LAST_CONFIG_BACKUP" ]] || die "Brak LAST_CONFIG_BACKUP."; restore_backup_dir "$(cat "${BASE}/LAST_CONFIG_BACKUP")"; else echo "Anulowano."; fi ;;
-                    0) : ;;
-                    *) echo "Nieprawidłowy wybór." ;;
-                esac
-                menu_pause
-                ;;
-            11)
-                echo
-                echo "Aktualizacja wymaga podłączonego UPS w stabilnym OL."
-                echo "Nie działa w BYPASS. Przed pobraniem zostanie utworzony backup."
-                echo "Źródło: oficjalna gałąź main repo Q-Tronic/proxmox-nut-powerwalker."
-                if menu_confirm_word AKTUALIZUJ "Skrypt pobierze i uruchomi kod instalatora jako root."; then
-                    if update_project; then
-                        echo
-                        echo "Aktualizacja zakończona. Zamykam stare menu."
-                        echo "Uruchom ponownie: nut-config menu"
-                        exit 0
-                    else
-                        warn "Aktualizacja nie została zakończona poprawnie. Sprawdź komunikaty powyżej."
-                    fi
-                else
-                    echo "Anulowano."
-                fi
-                menu_pause
-                ;;
-            12) help_text; menu_pause ;;
-            0) exit 0 ;;
-            *) echo "Nieprawidłowy wybór."; menu_pause ;;
+            1) show; menu_pause ;; 2) menu_shutdown ;;
+            3) echo; echo "1) Pokaż UPS/USB"; echo "2) Auto-detect"; echo "0) Anuluj"; read -r -p "Wybór: " v; case "${v}" in 1) echo "UPS_NAME=${UPS_NAME}"; echo "UPS_DRIVER=${UPS_DRIVER}"; echo "UPS_PORT=${UPS_PORT}"; echo "UPS_VENDORID=${UPS_VENDORID}"; echo "UPS_PRODUCTID=${UPS_PRODUCTID}"; echo "UPS_SUBDRIVER=${UPS_SUBDRIVER}" ;; 2) if menu_confirm_word WYKRYJ "Auto-detect może zmienić konfigurację i restartować NUT."; then detect_ups; else echo "Anulowano."; fi ;; 0) : ;; *) echo "Nieprawidłowy wybór." ;; esac; menu_pause ;;
+            4) echo; echo "1) Dane HA (HASŁO)"; echo "2) LAN auto"; echo "3) LAN off"; echo "4) IP"; echo "5) port"; echo "0) Anuluj"; read -r -p "Wybór: " v; case "${v}" in 1) if menu_confirm_word POKAZ "Pokażę hasło HA."; then /usr/local/sbin/nut-ha-info; else echo "Anulowano."; fi ;; 2) set_key NUT_LISTEN_IP auto ;; 3) set_key NUT_LISTEN_IP off ;; 4) read -r -p "IP: " ip; set_key NUT_LISTEN_IP "${ip}" ;; 5) read -r -p "Port: " port; set_key NUT_PORT "${port}" ;; 0) : ;; *) echo "Nieprawidłowy wybór." ;; esac; menu_pause ;;
+            5) echo; echo "1) Status"; echo "2) Włącz"; echo "3) Wyłącz"; echo "0) Anuluj"; read -r -p "Wybór: " v; case "${v}" in 1) monitor_cmd status ;; 2) monitor_cmd enable ;; 3) if menu_confirm_word WYLACZ "Wyłącza automatyczną ochronę hosta."; then monitor_cmd disable; else echo "Anulowano."; fi ;; 0) : ;; *) echo "Nieprawidłowy wybór." ;; esac; menu_pause ;;
+            6) menu_bypass ;; 7) menu_powercycle ;;
+            8) echo; echo "1) Probe (read-only)"; echo "2) Quick self-test"; echo "0) Anuluj"; read -r -p "Wybór: " v; case "${v}" in 1) selftest_probe || true ;; 2) if menu_confirm_word TESTUJ "Self-test jest warunkowy i nie gwarantuje wyniku firmware."; then selftest_quick TESTUJ; else echo "Anulowano."; fi ;; 0) : ;; *) echo "Nieprawidłowy wybór." ;; esac; menu_pause ;;
+            9) echo; echo "1) Status"; echo "2) Setup"; echo "3) Show bez hasła"; echo "4) Interval"; echo "5) Disable"; echo "0) Anuluj"; read -r -p "Wybór: " v; case "${v}" in 1) mqtt_cmd status ;; 2) mqtt_cmd setup ;; 3) mqtt_cmd show ;; 4) read -r -p "Sekundy: " sec; mqtt_cmd interval "${sec}" ;; 5) mqtt_cmd disable ;; 0) : ;; *) echo "Nieprawidłowy wybór." ;; esac; menu_pause ;;
+            10) echo; echo "1) Doctor"; echo "2) Prowadzony OL->OB->OL"; echo "3) nut-status"; echo "4) capabilities"; echo "5) logi"; echo "6) raport prywatny"; echo "7) raport publiczny"; echo "8) test guide"; echo "0) Anuluj"; read -r -p "Wybór: " v; case "${v}" in 1) doctor_cmd || true ;; 2) guided_outage_test || true ;; 3) /usr/local/sbin/nut-status ;; 4) /usr/local/sbin/nut-capabilities ;; 5) /usr/local/sbin/nut-logs 100 ;; 6) /usr/local/sbin/nut-report ;; 7) if menu_confirm_word PUBLICZNY "Redakcja jest best-effort; przejrzyj plik."; then /usr/local/sbin/nut-report --public; else echo "Anulowano."; fi ;; 8) /usr/local/sbin/nut-test-guide ;; 0) : ;; *) echo "Nieprawidłowy wybór." ;; esac; menu_pause ;;
+            11) echo; echo "1) Create"; echo "2) List"; echo "3) Restore LAST"; echo "4) Restore nazwa"; echo "5) Prune"; echo "0) Anuluj"; read -r -p "Wybór: " v; case "${v}" in 1) backup_now ;; 2) backup_list ;; 3) if menu_confirm_word PRZYWROC "Powstanie dodatkowy backup bezpieczeństwa."; then backup_restore_cmd LAST; else echo "Anulowano."; fi ;; 4) backup_list; read -r -p "Nazwa config-...: " ref; if menu_confirm_word PRZYWROC "Przywrócę ${ref}."; then backup_restore_cmd "${ref}"; else echo "Anulowano."; fi ;; 5) read -r -p "Zachowaj ile [${CONFIG_BACKUP_KEEP}]: " keep; keep="${keep:-${CONFIG_BACKUP_KEEP}}"; if menu_confirm_word USUN "Usunę starsze backupy ponad limit."; then prune_backups "${keep}"; else echo "Anulowano."; fi ;; 0) : ;; *) echo "Nieprawidłowy wybór." ;; esac; menu_pause ;;
+            12) echo; echo "1) Status"; echo "2) Run"; echo "3) Enable"; echo "4) Disable"; echo "0) Anuluj"; read -r -p "Wybór: " v; case "${v}" in 1) watchdog_cmd status ;; 2) watchdog_cmd run || true ;; 3) watchdog_cmd enable ;; 4) watchdog_cmd disable ;; 0) : ;; *) echo "Nieprawidłowy wybór." ;; esac; menu_pause ;;
+            13) echo; version_cmd; echo; echo "1) Check"; echo "2) Update"; echo "3) channel main"; echo "4) channel stable"; echo "5) force reinstall"; echo "0) Anuluj"; read -r -p "Wybór: " v; case "${v}" in 1) update_check || true ;; 2) if menu_confirm_word AKTUALIZUJ "Wymaga stabilnego OL i tworzy backup."; then update_project; exit 0; else echo "Anulowano."; fi ;; 3) update_channel_set main ;; 4) update_channel_set stable ;; 5) if menu_confirm_word AKTUALIZUJ "Wymuszę reinstall wybranego ref."; then update_project --force; exit 0; else echo "Anulowano."; fi ;; 0) : ;; *) echo "Nieprawidłowy wybór." ;; esac; menu_pause ;;
+            14) help_text; menu_pause ;; 0) exit 0 ;; *) echo "Nieprawidłowy wybór."; menu_pause ;;
         esac
     done
 }
@@ -2629,7 +2917,7 @@ case "${cmd}" in
         [[ $# -eq 1 ]] || die "nut-config get KLUCZ"
         key="$1"
         case "${key}" in
-            UPS_NAME|UPS_DESC|UPS_DRIVER|UPS_PORT|UPS_VENDORID|UPS_PRODUCTID|UPS_SUBDRIVER|NUT_LISTEN_IP|NUT_PORT|SHUTDOWN_DELAY|TIMED_SHUTDOWN|LOWBATT_SHUTDOWN|POLLFREQ|POLLFREQALERT|HOSTSYNC|DEADTIME|FINALDELAY|RBWARNTIME|NOCOMMWARNTIME|LOG_ROTATE_SIZE|LOG_ROTATE_COUNT|UPSMON_ROLE|POWERCYCLE_ENABLED|POWERCYCLE_OFFDELAY|POWERCYCLE_ONDELAY)
+            UPS_NAME|UPS_DESC|UPS_DRIVER|UPS_PORT|UPS_VENDORID|UPS_PRODUCTID|UPS_SUBDRIVER|NUT_LISTEN_IP|NUT_PORT|SHUTDOWN_DELAY|TIMED_SHUTDOWN|LOWBATT_SHUTDOWN|POLLFREQ|POLLFREQALERT|HOSTSYNC|DEADTIME|FINALDELAY|RBWARNTIME|NOCOMMWARNTIME|LOG_ROTATE_SIZE|LOG_ROTATE_COUNT|UPSMON_ROLE|POWERCYCLE_ENABLED|POWERCYCLE_OFFDELAY|POWERCYCLE_ONDELAY|UPDATE_CHANNEL|CONFIG_BACKUP_KEEP)
                 printf '%s\n' "${!key}"
                 ;;
             *)
@@ -2712,23 +3000,58 @@ case "${cmd}" in
     monitor)
         monitor_cmd "${1:-status}"
         ;;
+    version)
+        version_cmd
+        ;;
+    doctor)
+        doctor_cmd "${1:-}"
+        ;;
+    test)
+        guided_outage_test
+        ;;
+    selftest)
+        selftest_cmd "$@"
+        ;;
+    watchdog)
+        watchdog_cmd "$@"
+        ;;
     update)
-        [[ $# -eq 0 ]] || die "Użycie: nut-config update"
-        update_project
+        if [[ "${1:-}" == "channel" ]]; then
+            [[ $# -eq 2 ]] || die "nut-config update channel main|stable"
+            update_channel_set "$2"
+        else
+            [[ $# -le 1 ]] || die "nut-config update [--check|--force]"
+            update_project "${1:-}"
+        fi
         ;;
     backup)
-        echo "$(backup_now)"
+        sub="${1:-create}"
+        case "${sub}" in
+            create) echo "$(backup_now)" ;;
+            list) backup_list ;;
+            restore) backup_restore_cmd "${2:-LAST}" ;;
+            prune) prune_backups "${2:-${CONFIG_BACKUP_KEEP}}" ;;
+            *) die "nut-config backup create|list|restore [LAST|config-...]|prune [N]" ;;
+        esac
         ;;
     rollback)
-        require_normal_mode
-        [[ -f "${BASE}/LAST_CONFIG_BACKUP" ]] || die "Brak LAST_CONFIG_BACKUP."
-        restore_backup_dir "$(cat "${BASE}/LAST_CONFIG_BACKUP")"
+        backup_restore_cmd LAST
         ;;
     report)
-        echo "=== Q-Tronic settings ==="
-        cat "${SETTINGS}"
-        echo
-        /usr/local/sbin/nut-report
+        case "${1:-}" in
+            '')
+                echo "=== Q-Tronic settings ==="
+                cat "${SETTINGS}"
+                echo
+                /usr/local/sbin/nut-report
+                ;;
+            --public|public)
+                /usr/local/sbin/nut-report --public
+                ;;
+            *)
+                die "Użycie: nut-config report [--public]"
+                ;;
+        esac
         ;;
     capabilities)
         /usr/local/sbin/nut-capabilities

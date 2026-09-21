@@ -29,6 +29,7 @@ REF="${QTRONIC_REF:-main}"
 RAW_BASE="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${REF}"
 SETUP_URL="${RAW_BASE}/setup-nut-powerwalker-proxmox.sh"
 CONFIG_URL="${RAW_BASE}/nut-config.sh"
+VERSION_URL="${RAW_BASE}/VERSION"
 
 PERSISTENT_INSTALLER="/root/setup-nut-powerwalker-proxmox.sh"
 PERSISTENT_CONFIG="/root/nut-config.sh"
@@ -76,12 +77,13 @@ command -v bash >/dev/null 2>&1 || die "Brak bash."
 TMP_DIR="$(mktemp -d /tmp/qtronic-nut-installer.XXXXXX)"
 TMP_SETUP="${TMP_DIR}/setup-nut-powerwalker-proxmox.sh"
 TMP_CONFIG="${TMP_DIR}/nut-config.sh"
+TMP_VERSION="${TMP_DIR}/VERSION"
 
 info "Źródło instalatora: ${SETUP_URL}"
 info "Źródło konfiguratora: ${CONFIG_URL}"
 info "Pobieram pliki Q-Tronic..."
 
-for pair in "${SETUP_URL}|${TMP_SETUP}" "${CONFIG_URL}|${TMP_CONFIG}"; do
+for pair in "${SETUP_URL}|${TMP_SETUP}" "${CONFIG_URL}|${TMP_CONFIG}" "${VERSION_URL}|${TMP_VERSION}"; do
     url="${pair%%|*}"
     dst="${pair#*|}"
 
@@ -118,6 +120,12 @@ head -n1 "${TMP_CONFIG}" | grep -Fq '#!/usr/bin/env bash' \
 
 grep -Fq '# Autor: Q-Tronic' "${TMP_CONFIG}" \
     || die "nut-config.sh nie zawiera oczekiwanego oznaczenia autora."
+
+VERSION_VALUE="$(tr -d '\r\n' < "${TMP_VERSION}")"
+[[ "${VERSION_VALUE}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]] || die "Plik VERSION ma nieprawidłowy format."
+grep -Fq "QTRONIC_VERSION=\"${VERSION_VALUE}\"" "${TMP_CONFIG}" \
+    || die "VERSION (${VERSION_VALUE}) nie zgadza się z QTRONIC_VERSION w nut-config.sh."
+info "Wersja projektu: ${VERSION_VALUE}"
 
 info "Sprawdzam składnię Bash..."
 bash -n "${TMP_SETUP}" || die "Główny instalator nie przeszedł bash -n."
@@ -178,5 +186,7 @@ echo "  nut-capabilities"
 echo "  nut-report"
 echo "  nut-ha-info"
 echo "  nut-mqtt-config"
+echo "  nut-config version"
+echo "  nut-config doctor"
 
 exit 0

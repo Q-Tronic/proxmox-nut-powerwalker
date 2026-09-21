@@ -1832,6 +1832,8 @@ echo "  nut-report"
 echo "  nut-ha-info"
 echo "  nut-mqtt-config"
 echo "  nut-config update"
+echo "  nut-config doctor"
+echo "  nut-config version"
 echo
 echo "Raport diagnostyczny:"
 echo "  nut-report"

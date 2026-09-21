@@ -4,7 +4,8 @@ Bezpieczna integracja UPS z **Proxmox VE** przy użyciu **Network UPS Tools (NUT
 
 Projekt jest przygotowany przede wszystkim dla **PowerWalker VI 2200 STL FR**. Może działać także z innymi UPS-ami USB HID obsługiwanymi przez NUT, ale dostępne dane i komendy zależą od modelu, firmware, wersji NUT i sterownika.
 
-Autor: **Q-Tronic**
+Autor: **Q-Tronic**  
+Wersja projektu: **1.0.0** (`VERSION` w repo)
 
 ## Co ten projekt robi
 
@@ -39,6 +40,7 @@ Po instalacji zacznij od:
 
 ```bash
 nut-status
+nut-config doctor
 nut-config show
 nut-capabilities
 nut-config powercycle probe
@@ -91,10 +93,13 @@ Menu pokazuje na górze aktualny `ups.status`, stan `nut-monitor`, power-cycle, 
 5) Monitor NUT
 6) BYPASS — bezpieczne odłączenie/powrót UPS
 7) Power-cycle UPS
-8) MQTT
-9) Diagnostyka i logi
-10) Backup / rollback
-11) Pomoc — dokładny opis wszystkich komend
+8) Self-test baterii (warunkowy)
+9) MQTT
+10) Doctor / prowadzony test / logi / raporty
+11) Backupy / rollback
+12) Read-only health watchdog
+13) Wersja / kanał / aktualizacja
+14) Pomoc — dokładny opis wszystkich komend
 0) Wyjście
 ```
 
@@ -973,19 +978,66 @@ Zmiany przez `set` są blokowane podczas BYPASS.
 
 # Backup / rollback / diagnostyka przez `nut-config`
 
-## `nut-config backup`
-
-```bash
-nut-config backup
-```
-
-Tworzy natychmiastowy, unikalny backup bieżącej konfiguracji w:
+Backupy `nut-config` są przechowywane w:
 
 ```text
 /root/nut-powerwalker/config-backups/
 ```
 
-i wypisuje utworzony katalog.
+Każdy backup ma unikalną nazwę. Domyślnie projekt zachowuje maksymalnie **30** najnowszych backupów; dopuszczalny limit to 5-200. Backup wskazywany przez `LAST_CONFIG_BACKUP` jest dodatkowo chroniony przed przypadkowym usunięciem.
+
+## `nut-config backup` / `nut-config backup create`
+
+```bash
+nut-config backup
+nut-config backup create
+```
+
+Obie formy tworzą natychmiastowy backup bieżącej konfiguracji i stanu usług. Komenda wypisuje utworzony katalog.
+
+## `nut-config backup list`
+
+```bash
+nut-config backup list
+```
+
+Pokazuje backupy od najnowszego do najstarszego. Aktualny backup `LAST` jest oznaczony.
+
+**Ryzyko:** tylko odczyt.
+
+## `nut-config backup restore`
+
+Najprościej przywrócić ostatni backup:
+
+```bash
+nut-config backup restore LAST
+```
+
+Można też wskazać konkretną nazwę z `backup list`:
+
+```bash
+nut-config backup restore config-YYYYmmdd-HHMMSS-XXXXXX
+```
+
+Przed przywróceniem zawsze powstaje **dodatkowy backup bezpieczeństwa**. Restore jest blokowany podczas BYPASS i przechodzi przez kontrolę bezpiecznego stanu UPS.
+
+Jeżeli wybrany backup miał aktywny power-cycle, skrypt przygotowuje fail-closed runtime przed przywróceniem, a po restarcie **ponownie** sprawdza capabilities i świeży fingerprint UPS. Jeśli walidacja po restore nie przejdzie, skrypt próbuje wrócić do backupu bezpieczeństwa zamiast pozostawiać niezweryfikowany power-cycle.
+
+## `nut-config backup prune`
+
+```bash
+nut-config backup prune 30
+```
+
+Usuwa starsze backupy ponad podany limit. Zakres: **5-200**.
+
+Zmiana domyślnego limitu:
+
+```bash
+nut-config set CONFIG_BACKUP_KEEP 40
+```
+
+Ta zmiana nie restartuje NUT.
 
 ## `nut-config rollback`
 
@@ -993,19 +1045,33 @@ i wypisuje utworzony katalog.
 nut-config rollback
 ```
 
-Przywraca **ostatni backup konfiguracji utworzony przez `nut-config`** oraz zapisany stan usług.
+Skrót przywracający `LAST_CONFIG_BACKUP`. To **nie jest** to samo co:
 
-To różni się od `nut-rollback`, który używa backupu głównego instalatora.
+```bash
+nut-rollback
+```
 
-Rollback konfiguracji jest blokowany podczas BYPASS.
+`nut-rollback` przywraca backup głównego instalatora, natomiast `nut-config rollback` pracuje na historii konfiguratora.
 
 ## `nut-config report`
 
+Raport prywatny:
+
 ```bash
 nut-config report
+nut-report
 ```
 
-Najpierw pokazuje centralne ustawienia Q-Tronic, a potem uruchamia pełny `nut-report`.
+Raport publiczny z dodatkową redakcją:
+
+```bash
+nut-config report --public
+nut-report --public
+```
+
+Tryb `--public` best-effort maskuje m.in. hostname, adresy IP, MAC, hasła, Machine/Boot ID oraz numer seryjny UPS. Model i VID/PID pozostają, ponieważ są przydatne diagnostycznie.
+
+**WAŻNE:** automatyczna redakcja nie jest gwarancją pełnej anonimizacji. Zawsze przejrzyj plik przed wrzuceniem go publicznie.
 
 ## `nut-config capabilities`
 
@@ -1093,80 +1159,116 @@ nut-phase2-check
 
 ---
 
-# Aktualizacja
+# Wersja i aktualizacja
 
-## Zalecana metoda
+Projekt ma własny plik `VERSION`. Aktualna wersja kodu jest również pokazywana przez:
 
-Przy podłączonym UPS-ie i stabilnym `OL` uruchom:
+```bash
+nut-config version
+```
+
+Przykładowy wynik:
+
+```text
+Q-Tronic Proxmox NUT PowerWalker
+Wersja lokalna: 1.0.0
+Kanał update:   main
+Repo:           Q-Tronic/proxmox-nut-powerwalker
+```
+
+## Sprawdzenie aktualizacji bez instalowania
+
+```bash
+nut-config update --check
+```
+
+Ta komenda tylko sprawdza wybrany kanał aktualizacji. Nie restartuje NUT i nie instaluje kodu.
+
+## Kanały aktualizacji
+
+Kanał bieżącego `main`:
+
+```bash
+nut-config update channel main
+```
+
+Kanał wydań oznaczonych GitHub Release:
+
+```bash
+nut-config update channel stable
+```
+
+`main` śledzi aktualny kod gałęzi głównej. `stable` pobiera najnowszy opublikowany GitHub Release i używa jego taga jako ref. Jeśli repo nie ma jeszcze żadnego Release, kanał `stable` **odmówi aktualizacji**, zamiast zgadywać wersję.
+
+Zmiana kanału zapisuje ustawienie, ale nie restartuje NUT.
+
+## Zalecana aktualizacja
+
+Przy podłączonym UPS i stabilnym `OL`:
 
 ```bash
 nut-config update
 ```
 
-To jest najprostsza i zalecana metoda dla zwykłego użytkownika. Komenda nie aktualizuje systemu „w ciemno”. Najpierw:
+Komenda:
 
-1. sprawdza, czy BYPASS nie jest aktywny;
-2. wymaga działającej komunikacji z UPS-em;
-3. wymaga stabilnego `OL` i odmawia aktualizacji podczas `OB`;
-4. tworzy dodatkowy backup bieżącej konfiguracji;
-5. pobiera oficjalny `install.sh` z `Q-Tronic/proxmox-nut-powerwalker` przez HTTPS;
-6. sprawdza podstawowe markery projektu oraz składnię `bash -n`;
-7. dopiero wtedy uruchamia właściwy bootstrap aktualizacyjny;
-8. instalator zachowuje istniejące dane dostępowe i centralne ustawienia Q-Tronic, a po aktualizacji ponownie waliduje stos NUT.
+1. odmawia pracy podczas BYPASS;
+2. wymaga komunikacji z UPS i stabilnego `OL`;
+3. tworzy backup konfiguracji;
+4. ustala ref zgodnie z kanałem `main` / `stable`;
+5. pobiera oficjalny `install.sh` przez HTTPS;
+6. sprawdza markery projektu i `bash -n`;
+7. uruchamia bootstrap z wybranym `QTRONIC_REF`;
+8. zachowuje dane dostępowe i ustawienia Q-Tronic;
+9. po instalacji ponownie waliduje UPS i stos NUT.
 
-Po udanej aktualizacji sprawdź:
+Jeżeli kanał `stable` wskazuje tę samą wersję, zwykłe `update` niczego nie reinstaluje. Świadomy reinstall:
 
 ```bash
+nut-config update --force
+```
+
+Po aktualizacji:
+
+```bash
+nut-config version
+nut-config doctor
 nut-status
-nut-config show
-nut-config powercycle status
 ```
 
-Jeśli aktualizacja zgłosi błąd, nie uruchamiaj kolejnych ryzykownych operacji. Najpierw:
+Jeżeli aktualizacja zgłosi błąd:
 
 ```bash
-nut-report
+nut-config doctor
+nut-report --public
+nut-config backup list
 ```
 
-i sprawdź utworzony backup.
+Nie wykonuj kolejnych ryzykownych zmian, dopóki nie wyjaśnisz przyczyny.
 
 ### Aktualizacja z menu
-
-Uruchom:
 
 ```bash
 nut-config menu
 ```
 
-i wybierz:
+Wybierz kategorię:
 
 ```text
-[AKTUALIZACJA] Pobierz i zainstaluj najnowszą wersję
+13) Wersja / kanał / aktualizacja
 ```
 
-Menu wyświetla ostrzeżenie i wymaga wpisania słowa:
+Menu potrafi sprawdzić wersję, zmienić kanał, uruchomić aktualizację i wymusić reinstall. Operacja instalująca kod wymaga dodatkowego potwierdzenia `AKTUALIZUJ`.
 
-```text
-AKTUALIZUJ
-```
-
-przed uruchomieniem kodu pobranego z repo jako `root`.
-
-### Metoda ręczna
-
-Można nadal użyć bezpośrednio publicznego bootstrapu:
+### Metoda ręczna dla `main`
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/Q-Tronic/proxmox-nut-powerwalker/main/install.sh)
 ```
 
-Ta metoda jest również zabezpieczona po stronie głównego setupu. **Aktualizacja/reinstalacja jest celowo blokowana podczas aktywnego BYPASS.** Najpierw trzeba ponownie podłączyć UPS i zakończyć BYPASS:
+Ręczny bootstrap również jest blokowany podczas aktywnego BYPASS przez główny setup.
 
-```bash
-nut-config resume
-```
-
-Nie aktualizuj podczas zaniku zasilania ani przy `ups.status: OB`.
+**Nie aktualizuj podczas `OB`, zaniku zasilania ani celowo odłączonego UPS.**
 
 ---
 
@@ -1175,6 +1277,103 @@ Nie aktualizuj podczas zaniku zasilania ani przy `ups.status: OB`.
 Głównym urządzeniem docelowym jest **PowerWalker VI 2200 STL FR**. Projekt zna wariant USB `0764:0601`, ale nie zakłada, że każdy egzemplarz lub firmware będzie raportował identyczne możliwości.
 
 Fizyczny power-cycle zależy od tego, co faktycznie udostępnia konkretny UPS. Samo pojawienie się `shutdown.return` w liście możliwości nie jest dowodem, że firmware zachowa się prawidłowo fizycznie — dlatego pierwszy rzeczywisty test należy wykonać pod nadzorem.
+
+
+---
+
+# Quality & Safety — dodatkowe zabezpieczenia
+
+## `nut-config doctor`
+
+```bash
+nut-config doctor
+```
+
+Zalecana komenda po instalacji, aktualizacji, ponownym podłączeniu UPS i po nietypowej sytuacji. Jest **read-only**: nie restartuje usług, nie zmienia konfiguracji i nie wysyła komend do UPS. Pokazuje `PASS / WARN / FAIL` dla narzędzi, plików, praw dostępu, usług, komunikacji, `OL/OB`, BYPASS, power-cycle, MQTT, backupów, watchdog i klastra Proxmox.
+
+## Prowadzony test `OL -> OB -> OL`
+
+```bash
+nut-config test
+```
+
+Kreator nie steruje zasilaniem UPS. Wymaga wyłączonego power-cycle, aktywnego `nut-monitor`, komunikacji i stabilnego `OL`. Jeżeli poziom baterii jest raportowany, wymaga co najmniej 30%. Przy aktywnym timerze wymaga też wystarczającego marginesu czasu i prowadzi użytkownika przez ręczne odłączenie wejścia UPS oraz szybki powrót do `OL`.
+
+## Self-test baterii
+
+Najpierw tylko odczyt możliwości:
+
+```bash
+nut-config selftest probe
+```
+
+Quick test, ale wyłącznie po świadomym potwierdzeniu:
+
+```bash
+nut-config selftest quick TESTUJ
+```
+
+Quick self-test jest dostępny tylko, gdy UPS jawnie raportuje odpowiednią komendę, pracuje stabilnie `OL`, nie ma `LOWBATT`, power-cycle jest wyłączony i bateria ma co najmniej 50% — jeśli poziom jest raportowany. Skrypt tworzy na czas pojedynczej operacji losowe konto NUT ograniczone do wymaganej komendy, a po zakończeniu przywraca oryginalny `upsd.users`.
+
+To nadal jest funkcja zależna od konkretnego firmware. Pierwszy test wykonuj pod nadzorem.
+
+## Read-only health watchdog
+
+```bash
+nut-config watchdog status
+nut-config watchdog run
+nut-config watchdog enable
+nut-config watchdog disable
+```
+
+Timer jest instalowany, ale **domyślnie wyłączony**. Po włączeniu uruchamia kontrolę mniej więcej co 5 minut. Sprawdza spójność usług, komunikacji, BYPASS i runtime power-cycle oraz zapisuje problemy do journala.
+
+Watchdog **niczego automatycznie nie naprawia, nie restartuje i nie wysyła komend do UPS**.
+
+## Klaster Proxmox
+
+`nut-config doctor` próbuje odczytać `pvecm status`. Przy aktywnym klastrze wielowęzłowym pokazuje ostrzeżenie, że projekt chroni lokalny host. Nie próbuje sam zarządzać migracjami, Proxmox HA ani quorum.
+
+## GitHub CI i Releases
+
+Repo zawiera:
+
+```text
+.github/workflows/ci.yml
+.github/workflows/release.yml
+tests/ci-check.py
+VERSION
+CHANGELOG.md
+```
+
+CI przy push/PR sprawdza składnię Bash, ShellCheck na poziomie błędów, osadzone bloki Python, YAML Home Assistant, zgodność `VERSION` z kodem, obecność dokumentacji kluczowych komend oraz brak uprawnień sterujących dla konta `homeassistant`.
+
+Workflow Release uruchamia się dla tagów `vX.Y.Z`, wymaga zgodności taga z `VERSION` i tworzy GitHub Release. Dzięki temu kanał `stable` może instalować konkretny opublikowany tag zamiast bieżącego `main`.
+
+---
+
+# Zalecana sekwencja po instalacji / aktualizacji
+
+```bash
+nut-config version
+nut-config doctor
+nut-status
+nut-config powercycle probe
+```
+
+Na nowym UPS najpierw wykonaj prowadzony:
+
+```bash
+nut-config test
+```
+
+Self-test baterii oraz pierwszy prawdziwy power-cycle wykonuj osobno i pod nadzorem. Przy `FAIL` z `doctor` najpierw zbierz diagnostykę:
+
+```bash
+nut-report --public
+```
+
+i usuń przyczynę przed ryzykownymi zmianami.
 
 ## Licencja
 
