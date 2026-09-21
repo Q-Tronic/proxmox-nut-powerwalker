@@ -1,0 +1,10 @@
+# Q-Tronic
+# Sekrety generowane są wyłącznie na serwerze i nie powinny trafiać do repo.
+
+credentials.env
+*.secret
+*.secrets
+*.log
+reports/
+backups/
+nut-mqtt.json
