@@ -204,6 +204,35 @@ if 'if bash "${PERSISTENT_CONFIG}" --install; then' not in install:
 if 'len(exact) > 1' not in setup or 'known_usb_count > 1' not in setup or 'Sam VID/PID nie rozróżni bezpiecznie egzemplarzy' not in setup:
     raise SystemExit("setup must reject ambiguous identical UPS detection")
 
+# Final five-point installer/rollback hotfix invariants.
+if 'BACKUP_DIR="$(mktemp -d "${BACKUP_ROOT}/nut-${TS}-XXXXXX")"' not in setup:
+    raise SystemExit("installer backup directory must be collision-safe")
+if 'Preflight aktualizacji/reinstalacji:' not in setup or 'Nie aktualizuję/reinstaluję podczas pracy z baterii.' not in setup:
+    raise SystemExit("managed reinstall must require stable OL before changes")
+if setup.index('Preflight aktualizacji/reinstalacji:') > setup.index('info "Tworzę backup bieżącej konfiguracji NUT..."'):
+    raise SystemExit("managed reinstall preflight must run before installer snapshot/change phase")
+for line in ['service_state nut-mqtt.service', 'service_state qtronic-nut-health.timer']:
+    if line not in setup:
+        raise SystemExit(f"installer snapshot missing optional service state: {line}")
+rollback_match = re.search(
+    r'atomic_install "\$\{LIB_DIR\}/rollback-last-backup\.sh" root root 0755 <<\'EOF_ROLLBACK\'\n(.*?)\nEOF_ROLLBACK',
+    setup,
+    flags=re.S,
+)
+if not rollback_match:
+    raise SystemExit("cannot locate strict installer snapshot rollback helper")
+rollback = rollback_match.group(1)
+if 'require_restored_ol' not in rollback or 'Monitor pozostaje rozbrojony' not in rollback:
+    raise SystemExit("installer rollback must validate OL before restoring active monitor")
+if 'restore_unit_state qtronic-nut-health.timer' not in rollback or 'restore_enable_state nut-mqtt.service' not in rollback:
+    raise SystemExit("installer rollback must restore optional service state")
+if 'NO_ETC_NUT_BEFORE_INSTALL' not in rollback or 'rm -rf /etc/nut' not in rollback:
+    raise SystemExit("installer rollback must restore absence of /etc/nut")
+if 'nut-rollback NIE cofa wersji kodu i NIE odinstalowuje pakietów.' not in rollback:
+    raise SystemExit("installer rollback scope must be explicit")
+if re.search(r'systemctl (?:start|restart) nut-monitor\.service[^\n]*\|\| true', rollback):
+    raise SystemExit("installer rollback must not swallow monitor start failures")
+
 release_workflow = (root / ".github" / "workflows" / "release.yml").read_text()
 if '--prerelease' not in release_workflow or '== *-*' not in release_workflow:
     raise SystemExit("RC tags must be published as GitHub prereleases")
