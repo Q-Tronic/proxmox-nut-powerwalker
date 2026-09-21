@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.0.0-rc2 — 2026-09-21
+
+Ostateczny hotfix bezpieczeństwa przed testami wydania.
+
+### Safety / correctness
+
+- BYPASS pokazuje `Gotowy do odpięcia: TAK` wyłącznie wtedy, gdy `nut-monitor` i `nut-mqtt` są jednocześnie zatrzymane oraz wyłączone z autostartu; status i `doctor` nie ufają już bezwarunkowo zapisanej fladze gotowości.
+- Walidacja backupu v2 odrzuca stan `absent` dla wymaganych plików konfiguracji i poświadczeń, dzięki czemu restore nie może pozornie zakończyć się sukcesem bez dokładnego odtworzenia krytycznych danych.
+- Dodano statyczne testy antyregresyjne obu poprawek.
+
 ## 1.0.0-rc1 — 2026-09-21
 
 Finalny kandydat przed testami na fizycznym PowerWalkerze.

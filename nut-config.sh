@@ -33,7 +33,7 @@ LOGROTATE="/etc/logrotate.d/nut-powerwalker"
 LOCK="/run/lock/qtronic-nut-config.lock"
 BYPASS_STATE="/etc/nut/qtronic-bypass-state.env"
 MARKER="# managed-by: q-tronic-nut-powerwalker-installer"
-QTRONIC_VERSION="1.0.0-rc1"
+QTRONIC_VERSION="1.0.0-rc2"
 VERSION_FILE="${BASE}/VERSION"
 WATCHDOG_SERVICE="qtronic-nut-health.service"
 WATCHDOG_TIMER="qtronic-nut-health.timer"
@@ -415,7 +415,7 @@ validate_backup_v2() {
         /etc/nut/qtronic-powercycle-capability.json
     )
     local -a expected_units=(nut-monitor.service nut-mqtt.service "${WATCHDOG_TIMER}")
-    local -A allowed_files=() seen_files=() allowed_units=() seen_units=()
+    local -A allowed_files=() required_files=() seen_files=() allowed_units=() seen_units=()
 
     [[ -f "${d}/backup-format.txt" ]] \
         && [[ ! -L "${d}/backup-format.txt" ]] \
@@ -428,6 +428,16 @@ validate_backup_v2() {
 
     for target in "${expected_files[@]}"; do
         allowed_files["${target}"]=1
+    done
+    for target in \
+        "${SETTINGS}" \
+        /etc/nut/ups.conf \
+        /etc/nut/upsd.conf \
+        /etc/nut/upsd.users \
+        /etc/nut/upsmon.conf \
+        /etc/nut/upssched.conf \
+        "${CREDS}"; do
+        required_files["${target}"]=1
     done
     while IFS= read -r line || [[ -n "${line}" ]]; do
         IFS=$'\t' read -r target state extra <<< "${line}"
@@ -442,9 +452,13 @@ validate_backup_v2() {
         if [[ "${state}" == "present" ]]; then
             [[ -f "${encoded}" && ! -L "${encoded}" ]] \
                 || { warn "Backup oznacza ${target} jako present, ale brak bezpiecznej kopii."; return 2; }
-        elif [[ -e "${encoded}" || -L "${encoded}" ]]; then
-            warn "Backup oznacza ${target} jako absent, ale zawiera kopię."
-            return 2
+        else
+            [[ -z "${required_files[${target}]:-}" ]] \
+                || { warn "Wymagany plik backupu nie może być oznaczony jako absent: ${target}."; return 2; }
+            if [[ -e "${encoded}" || -L "${encoded}" ]]; then
+                warn "Backup oznacza ${target} jako absent, ale zawiera kopię."
+                return 2
+            fi
         fi
     done < "${d}/file-state.txt"
     for target in "${expected_files[@]}"; do
@@ -579,6 +593,11 @@ backup_now() {
             "${unit}" "$(service_active_bit "${unit}")" "$(service_enabled_bit "${unit}")" >> "${d}/service-state.txt"
     done
     printf 'format=2\n' > "${d}/backup-format.txt"
+
+    if ! validate_backup_v2 "${d}"; then
+        rm -rf -- "${d}"
+        die "Nie utworzono backupu: brakuje wymaganych plików lub manifest jest niespójny."
+    fi
 
     printf '%s\n' "${d}" > "${BASE}/LAST_CONFIG_BACKUP"
     chmod 0600 "${BASE}/LAST_CONFIG_BACKUP"
@@ -2095,6 +2114,25 @@ service_enabled_bit() {
     systemctl is-enabled --quiet "$1" 2>/dev/null && echo 1 || echo 0
 }
 
+bypass_services_quiesced() {
+    local unit
+    for unit in nut-monitor.service nut-mqtt.service; do
+        systemctl is-active --quiet "${unit}" 2>/dev/null && return 1
+        systemctl is-enabled --quiet "${unit}" 2>/dev/null && return 1
+    done
+    return 0
+}
+
+require_bypass_services_quiesced() {
+    local unit
+    for unit in nut-monitor.service nut-mqtt.service; do
+        systemctl is-active --quiet "${unit}" 2>/dev/null \
+            && die "${unit} nadal działa. NIE odłączaj UPS."
+        systemctl is-enabled --quiet "${unit}" 2>/dev/null \
+            && die "${unit} nadal jest włączony w autostarcie. NIE odłączaj UPS."
+    done
+}
+
 restore_service_state() {
     local unit="$1" was_active="$2" was_enabled="$3" rc=0
 
@@ -2127,7 +2165,7 @@ bypass_mark_ready() {
 }
 
 bypass_status() {
-    local status
+    local status ready=0
     status="$(status_now || true)"
 
     echo "============================================================"
@@ -2149,15 +2187,18 @@ bypass_status() {
 
     # shellcheck disable=SC1090
     source "${BYPASS_STATE}"
+    if [[ "${BYPASS_READY:-0}" == "1" ]] && bypass_services_quiesced; then
+        ready=1
+    fi
     echo "BYPASS:              TAK"
-    echo "Gotowy do odpięcia:   $([[ "${BYPASS_READY:-0}" == "1" ]] && echo TAK || echo NIE)"
+    echo "Gotowy do odpięcia:   $([[ "${ready}" == "1" ]] && echo TAK || echo NIE)"
     echo "Ochrona UPS:          celowo wstrzymana"
     echo "Włączono epoch:       ${BYPASS_ENTERED_EPOCH:-brak}"
     echo "Poprzedni monitor:    $([[ "${PREV_MONITOR_ACTIVE:-0}" == "1" ]] && echo aktywny || echo nieaktywny)"
     echo "Poprzedni MQTT:       $([[ "${PREV_MQTT_ACTIVE:-0}" == "1" ]] && echo aktywny || echo nieaktywny)"
     echo "Poprzedni powercycle: $([[ "${PREV_POWERCYCLE:-0}" == "1" ]] && echo aktywny || echo nieaktywny)"
     echo "ups.status teraz:     ${status:-brak komunikacji (normalne po odłączeniu UPS)}"
-    if [[ "${BYPASS_READY:-0}" != "1" ]]; then
+    if [[ "${ready}" != "1" ]]; then
         echo
         echo "UWAGA: BYPASS NIE zakończył przygotowania. NIE ODŁĄCZAJ UPS."
         echo "Aby wrócić do normalnego trybu: nut-config resume"
@@ -2213,10 +2254,6 @@ bypass_enable() {
     systemctl disable --now nut-monitor.service >/dev/null 2>&1 || true
     systemctl disable --now nut-mqtt.service >/dev/null 2>&1 || true
 
-    if systemctl is-active --quiet nut-monitor.service 2>/dev/null; then
-        die "Nie udało się zatrzymać nut-monitor. NIE odłączaj UPS."
-    fi
-
     # Usuwamy późny hook/flagę zanim cokolwiek fizycznie odłączysz.
     remove_powercycle_runtime
 
@@ -2230,6 +2267,7 @@ bypass_enable() {
         remove_powercycle_runtime
     fi
 
+    require_bypass_services_quiesced
     bypass_mark_ready 1
 
     ok "Tryb BYPASS WŁĄCZONY I GOTOWY DO FIZYCZNEGO ODŁĄCZENIA UPS."
@@ -2348,7 +2386,9 @@ doctor_cmd() {
     systemctl is-active --quiet nut-server.service 2>/dev/null && doctor_pass "nut-server aktywny" || doctor_fail "nut-server nieaktywny"
     if bypass_active; then
         source "${BYPASS_STATE}"
-        [[ "${BYPASS_READY:-0}" == "1" ]] && doctor_pass "BYPASS aktywny i gotowy" || doctor_fail "BYPASS aktywny, ale niegotowy"
+        [[ "${BYPASS_READY:-0}" == "1" ]] && bypass_services_quiesced \
+            && doctor_pass "BYPASS aktywny i gotowy" \
+            || doctor_fail "BYPASS aktywny, ale niegotowy"
         systemctl is-active --quiet nut-monitor.service 2>/dev/null && doctor_fail "nut-monitor działa podczas BYPASS" || doctor_pass "nut-monitor zatrzymany w BYPASS"
         if [[ -x "${INSTALL_DIR}/qtronic-shutdown-wrapper.sh" || -e "${POWERCYCLE_FLAG}" || -x /usr/lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} || -x /lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} ]]; then doctor_fail "runtime power-cycle istnieje podczas BYPASS"; else doctor_pass "runtime power-cycle usunięty podczas BYPASS"; fi
         doctor_info "brak komunikacji z UPS jest oczekiwany po fizycznym odłączeniu w BYPASS"
