@@ -8,6 +8,7 @@ W pełnej paczce repozytorium znajdują się m.in.:
 
 ```text
 install.sh
+nut-config.sh
 setup-nut-powerwalker-proxmox.sh
 README.md
 LICENSE
@@ -43,6 +44,7 @@ Przy pełnym pierwszym wgraniu główne pliki to:
 
 ```text
 install.sh
+nut-config.sh
 setup-nut-powerwalker-proxmox.sh
 README.md
 LICENSE
@@ -99,6 +101,61 @@ apt update && apt install -y curl ca-certificates
 i ponów pierwszą komendę.
 
 `install.sh` pobierze właściwy duży instalator, sprawdzi jego podstawowe markery i składnię Bash, zapisze go w `/root/setup-nut-powerwalker-proxmox.sh`, a następnie uruchomi.
+
+
+## Konfiguracja po instalacji
+
+Po instalacji wszystko, co normalnie powinno być zmieniane, ustawiasz z SSH.
+
+Pokaż konfigurację:
+
+```bash
+nut-config
+```
+
+albo:
+
+```bash
+nut-config show
+```
+
+Menu:
+
+```bash
+nut-config menu
+```
+
+Przykład — shutdown po dwóch minutach:
+
+```bash
+nut-delay 2m
+```
+
+Home Assistant:
+
+```bash
+nut-config ha show
+```
+
+MQTT:
+
+```bash
+nut-config mqtt setup
+```
+
+Ponowne wykrycie UPS po USB:
+
+```bash
+nut-config ups auto
+```
+
+Pełna pomoc:
+
+```bash
+nut-config help
+```
+
+Zmiany mają backup i walidację. Gdy UPS pracuje na baterii, aktywna konfiguracja bezpieczeństwa nie jest przeładowywana.
 
 ## 6. Po instalacji
 

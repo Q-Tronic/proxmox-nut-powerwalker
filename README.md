@@ -45,7 +45,7 @@ Najprościej: zaloguj się jako `root` przez SSH i uruchom jedną komendę:
 bash <(curl -fsSL https://raw.githubusercontent.com/Q-Tronic/proxmox-nut-powerwalker/main/install.sh)
 ```
 
-`install.sh` jest małym bootstrapem: pobiera właściwy `setup-nut-powerwalker-proxmox.sh`, sprawdza czy plik wygląda jak skrypt Q-Tronic, wykonuje `bash -n`, zapisuje kopię jako `/root/setup-nut-powerwalker-proxmox.sh` i dopiero wtedy uruchamia główny instalator.
+`install.sh` jest małym bootstrapem: pobiera właściwy `setup-nut-powerwalker-proxmox.sh` oraz `nut-config.sh`, sprawdza ich oznaczenia i składnię `bash -n`, zapisuje kopie w `/root`, uruchamia główny instalator, a następnie instaluje centralny konfigurator `nut-config`.
 
 Jeśli na Proxmoxie nie ma `curl`, najpierw:
 
@@ -75,6 +75,152 @@ git clone https://github.com/Q-Tronic/proxmox-nut-powerwalker.git
 cd proxmox-nut-powerwalker
 bash ./setup-nut-powerwalker-proxmox.sh
 ```
+
+
+## Konfiguracja po instalacji
+
+Po instalacji nie musisz ponownie edytować skryptów. Centralnym poleceniem jest:
+
+```bash
+nut-config
+```
+
+Aktualne ustawienia:
+
+```bash
+nut-config show
+```
+
+Menu:
+
+```bash
+nut-config menu
+```
+
+Najczęstsza zmiana — czas przed automatycznym shutdownem:
+
+```bash
+nut-delay 90
+nut-delay 2m
+nut-delay 1h
+```
+
+Samo:
+
+```bash
+nut-delay
+```
+
+pokazuje aktualną wartość.
+
+Polityka shutdownu:
+
+```bash
+nut-config timed on
+nut-config timed off
+
+nut-config lowbatt on
+nut-config lowbatt off
+```
+
+Dostęp NUT dla Home Assistanta:
+
+```bash
+nut-config listen auto
+nut-config listen off
+nut-config listen 192.168.1.10
+
+nut-config port 3493
+```
+
+Ważna decyzja projektowa: lokalny control-plane NUT pozostaje zawsze na `127.0.0.1:3493`. Zmieniany port dotyczy tylko dostępu z LAN/Home Assistanta. Dzięki temu zmiana portu HA nie rozłącza `upsmon`, lokalnego monitoringu ani MQTT.
+
+Zaawansowane czasy NUT:
+
+```bash
+nut-config set POLLFREQ 5
+nut-config set POLLFREQALERT 5
+nut-config set HOSTSYNC 15
+nut-config set DEADTIME 15
+nut-config set FINALDELAY 5
+nut-config set RBWARNTIME 43200
+nut-config set NOCOMMWARNTIME 300
+```
+
+USB/sterownik UPS:
+
+```bash
+nut-config ups show
+nut-config ups auto
+
+nut-config usb 0764 0601
+nut-config usb auto auto
+
+nut-config set UPS_DESC "PowerWalker VI 2200 STL FR"
+nut-config set UPS_DRIVER usbhid-ups
+nut-config set UPS_PORT auto
+nut-config set UPS_SUBDRIVER "CyberPower HID"
+```
+
+Logi:
+
+```bash
+nut-config set LOG_ROTATE_SIZE 512k
+nut-config set LOG_ROTATE_COUNT 6
+nut-config logs 100
+```
+
+Home Assistant:
+
+```bash
+nut-config ha show
+nut-config ha rotate
+```
+
+Można również obrócić hasło lokalnego użytkownika monitorującego NUT:
+
+```bash
+nut-config primary rotate
+```
+
+MQTT:
+
+```bash
+nut-config mqtt setup
+nut-config mqtt status
+nut-config mqtt show
+nut-config mqtt interval 15
+nut-config mqtt disable
+```
+
+Monitor:
+
+```bash
+nut-config monitor status
+nut-config monitor enable
+nut-config monitor disable
+```
+
+Backup i rollback:
+
+```bash
+nut-config backup
+nut-config rollback
+```
+
+Diagnostyka:
+
+```bash
+nut-config report
+nut-config capabilities
+nut-config powercycle status
+```
+
+Każda normalna zmiana konfiguracji tworzy backup. Jeśli aktywny `nut-monitor` widzi `OB` albo utracił komunikację z UPS-em, konfigurator odmawia przeładowania ustawień. Po zmianie wymagane jest stabilne `OL`; jeśli walidacja się nie powiedzie, konfigurator przywraca poprzednią konfigurację.
+
+`UPS_NAME` pozostaje stałym identyfikatorem logicznym. To celowe: zapobiega rozjechaniu odwołań pomiędzy NUT, MQTT i Home Assistantem. Opis urządzenia, sterownik, port urządzenia, VID/PID, subdriver, polityka shutdownu, sieć, timingi, logowanie, MQTT i hasła można zmieniać po instalacji.
+
+Funkcje fizycznego odcinania wyjścia UPS (`shutdown.return`, `load.off` itd.) pozostają oddzielnie zablokowane, dopóki konkretna sztuka UPS nie potwierdzi ich obsługi.
 
 ## Najważniejsze komendy po instalacji
 
@@ -240,6 +386,7 @@ Najprościej zrobić to w przeglądarce telefonu na `github.com`.
 5. Wybierz **Add file → Upload files**.
 6. Wgraj:
    - `install.sh`
+   - `nut-config.sh`
    - `setup-nut-powerwalker-proxmox.sh`
    - `README.md`
    - `.gitignore`

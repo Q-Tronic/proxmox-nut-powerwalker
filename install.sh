@@ -28,8 +28,10 @@ REF="${QTRONIC_REF:-main}"
 
 RAW_BASE="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${REF}"
 SETUP_URL="${RAW_BASE}/setup-nut-powerwalker-proxmox.sh"
+CONFIG_URL="${RAW_BASE}/nut-config.sh"
 
 PERSISTENT_INSTALLER="/root/setup-nut-powerwalker-proxmox.sh"
+PERSISTENT_CONFIG="/root/nut-config.sh"
 TMP_DIR=""
 
 C_GREEN='\033[1;32m'
@@ -73,25 +75,32 @@ command -v bash >/dev/null 2>&1 || die "Brak bash."
 
 TMP_DIR="$(mktemp -d /tmp/qtronic-nut-installer.XXXXXX)"
 TMP_SETUP="${TMP_DIR}/setup-nut-powerwalker-proxmox.sh"
+TMP_CONFIG="${TMP_DIR}/nut-config.sh"
 
-info "Źródło: ${SETUP_URL}"
-info "Pobieram właściwy instalator..."
+info "Źródło instalatora: ${SETUP_URL}"
+info "Źródło konfiguratora: ${CONFIG_URL}"
+info "Pobieram pliki Q-Tronic..."
 
-curl \
-    --fail \
-    --silent \
-    --show-error \
-    --location \
-    --retry 3 \
-    --retry-delay 2 \
-    --connect-timeout 10 \
-    --max-time 120 \
-    --proto '=https' \
-    --tlsv1.2 \
-    "${SETUP_URL}" \
-    -o "${TMP_SETUP}"
+for pair in "${SETUP_URL}|${TMP_SETUP}" "${CONFIG_URL}|${TMP_CONFIG}"; do
+    url="${pair%%|*}"
+    dst="${pair#*|}"
 
-[[ -s "${TMP_SETUP}" ]] || die "Pobrany instalator jest pusty."
+    curl \
+        --fail \
+        --silent \
+        --show-error \
+        --location \
+        --retry 3 \
+        --retry-delay 2 \
+        --connect-timeout 10 \
+        --max-time 120 \
+        --proto '=https' \
+        --tlsv1.2 \
+        "${url}" \
+        -o "${dst}"
+
+    [[ -s "${dst}" ]] || die "Pobrany plik jest pusty: ${url}"
+done
 
 # Proste sanity-checki chronią przed uruchomieniem strony błędu/HTML
 # albo przypadkowo podmienionego pliku.
@@ -104,13 +113,22 @@ grep -Fq '# Autor: Q-Tronic' "${TMP_SETUP}" \
 grep -Fq 'managed-by: q-tronic-nut-powerwalker-installer' "${TMP_SETUP}" \
     || die "Pobrany skrypt nie zawiera oczekiwanego markera instalatora."
 
+head -n1 "${TMP_CONFIG}" | grep -Fq '#!/usr/bin/env bash' \
+    || die "nut-config.sh nie wygląda jak skrypt Bash."
+
+grep -Fq '# Autor: Q-Tronic' "${TMP_CONFIG}" \
+    || die "nut-config.sh nie zawiera oczekiwanego oznaczenia autora."
+
 info "Sprawdzam składnię Bash..."
 bash -n "${TMP_SETUP}" || die "Główny instalator nie przeszedł bash -n."
+bash -n "${TMP_CONFIG}" || die "nut-config.sh nie przeszedł bash -n."
 
-# Zachowujemy dokładną pobraną wersję na serwerze.
+# Zachowujemy dokładne pobrane wersje na serwerze.
 install -o root -g root -m 0700 "${TMP_SETUP}" "${PERSISTENT_INSTALLER}"
+install -o root -g root -m 0700 "${TMP_CONFIG}" "${PERSISTENT_CONFIG}"
 
 ok "Instalator zapisany: ${PERSISTENT_INSTALLER}"
+ok "Konfigurator zapisany: ${PERSISTENT_CONFIG}"
 
 echo
 echo "============================================================"
@@ -125,20 +143,40 @@ echo
 bash "${PERSISTENT_INSTALLER}"
 RC=$?
 
-echo
-if [[ "${RC}" -eq 0 ]]; then
-    ok "Główny instalator zakończył pracę poprawnie."
+if [[ "${RC}" -ne 0 ]]; then
     echo
-    echo "Przydatne komendy:"
-    echo "  nut-status"
-    echo "  nut-capabilities"
-    echo "  nut-report"
-    echo "  nut-ha-info"
-    echo "  nut-mqtt-config"
-else
     warn "Główny instalator zakończył się kodem ${RC}."
+    echo "Konfigurator nie będzie nakładany na niedokończoną instalację."
     echo "Uruchom, jeśli zostały utworzone:"
     echo "  nut-report"
+    exit "${RC}"
 fi
 
-exit "${RC}"
+ok "Główny instalator zakończył pracę poprawnie."
+
+echo
+info "Instaluję/aktualizuję centralny konfigurator nut-config..."
+bash "${PERSISTENT_CONFIG}" --install
+CFG_RC=$?
+
+if [[ "${CFG_RC}" -ne 0 ]]; then
+    warn "nut-config zakończył się kodem ${CFG_RC}."
+    exit "${CFG_RC}"
+fi
+
+echo
+ok "Instalacja Q-Tronic zakończona."
+echo
+echo "Konfiguracja także po instalacji:"
+echo "  nut-config"
+echo "  nut-config menu"
+echo "  nut-delay 2m"
+echo
+echo "Diagnostyka:"
+echo "  nut-status"
+echo "  nut-capabilities"
+echo "  nut-report"
+echo "  nut-ha-info"
+echo "  nut-mqtt-config"
+
+exit 0
