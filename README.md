@@ -5,7 +5,7 @@ Bezpieczna integracja UPS z **Proxmox VE** przy użyciu **Network UPS Tools (NUT
 Projekt jest przygotowany przede wszystkim dla **PowerWalker VI 2200 STL FR**. Może działać także z innymi UPS-ami USB HID obsługiwanymi przez NUT, ale dostępne dane i komendy zależą od modelu, firmware, wersji NUT i sterownika.
 
 Autor: **Q-Tronic**  
-Wersja projektu: **1.0.0** (`VERSION` w repo)
+Wersja projektu: **1.0.0-rc1** (`VERSION` w repo) — release candidate do testów na fizycznym UPS
 
 ## Co ten projekt robi
 
@@ -14,7 +14,7 @@ Domyślna polityka jest prosta:
 - Proxmox sam podejmuje decyzję o shutdownie — Home Assistant i MQTT nie są do tego potrzebne;
 - po przejściu UPS na baterię (`OB`) uruchamiany jest timer, domyślnie **60 s**;
 - jeśli zasilanie wróci przed końcem timera (`OL`), shutdown jest anulowany;
-- `LOWBATT` może natychmiast rozpocząć FSD/shutdown;
+- stan krytyczny `OB+LB` / `LOWBATT` jest obsługiwany **natywnie przez `upsmon`** i może natychmiast rozpocząć FSD/shutdown; tej ochrony projekt nie pozwala wyłączyć;
 - `nut-monitor` jest uzbrajany tylko po potwierdzeniu komunikacji z UPS i stabilnego `OL`;
 - power-cycle UPS jest domyślnie **wyłączony** i ma osobną bramkę bezpieczeństwa;
 - planowane fizyczne odłączenie UPS wykonuje się przez tryb **BYPASS**, a nie przez samo wyrwanie USB.
@@ -25,6 +25,7 @@ Domyślna polityka jest prosta:
 - dostęp `root`;
 - UPS podłączony do hosta przez USB;
 - Internet podczas instalacji pakietów i pobrania skryptów.
+- przy wielu UPS-ach USB instalator nie zgaduje; dwa identyczne urządzenia z tym samym VID/PID należy na czas pierwszej konfiguracji fizycznie rozdzielić/odłączyć pozostałe.
 
 ## Instalacja
 
@@ -46,7 +47,7 @@ nut-capabilities
 nut-config powercycle probe
 ```
 
-`powercycle probe` jest **tylko odczytem**. Nie odcina zasilania i nie wysyła `shutdown.return`.
+`powercycle probe` jest **tylko odczytem**. Nie odcina zasilania, nie wysyła `shutdown.return` i nie nadpisuje zapisanego capability/fingerprintu używanego do uzbrojenia power-cycle.
 
 ---
 
@@ -87,7 +88,7 @@ Menu pokazuje na górze aktualny `ups.status`, stan `nut-monitor`, power-cycle, 
 
 ```text
 1) Status i wszystkie ustawienia
-2) Shutdown: timer / delay / LOWBATT
+2) Shutdown: timer / delay / wyjaśnienie LOWBATT
 3) UPS / USB
 4) LAN / Home Assistant
 5) Monitor NUT
@@ -449,6 +450,8 @@ Komenda jest blokowana podczas BYPASS.
 
 **Nie używaj podczas awarii zasilania.**
 
+Od RC1 każda operacja, która renderuje konfigurację lub restartuje stos NUT, wymaga stabilnego `OL` **niezależnie od tego, czy `nut-monitor` jest aktualnie włączony**. Brak komunikacji nie jest traktowany jako bezpieczne okno do zmian.
+
 ---
 
 # Shutdown
@@ -503,23 +506,21 @@ Wyłącza timer shutdownu po czasie. Reakcja `LOWBATT` jest niezależna i może 
 
 **Wyłączenie timera zmniejsza ochronę przy długim zaniku zasilania.**
 
-## `nut-config lowbatt on`
+## `nut-config lowbatt status` / `nut-config lowbatt on`
 
 ```bash
-nut-config lowbatt on
+nut-config lowbatt status
 ```
 
-Włącza natychmiastowy FSD po `LOWBATT`. To ustawienie zalecane.
+Od `1.0.0-rc1` projekt **nie implementuje własnego przełącznika LOWBATT**. NUT `upsmon` traktuje stan `OB+LB` jako krytyczny i sam rozpoczyna FSD zgodnie ze swoim mechanizmem ochrony. Komenda `status` pokazuje tę zasadę, a zgodnościowe `on` jest bezpiecznym no-op.
 
-## `nut-config lowbatt off`
+Próba:
 
 ```bash
 nut-config lowbatt off
 ```
 
-`LOWBATT` zostanie zalogowany, ale nie uruchomi awaryjnego FSD przez tę regułę.
-
-**To wyraźnie zmniejsza ochronę hosta.**
+jest celowo **odrzucana**. Nie oferujemy opcji wyłączenia natywnej ochrony `OB+LB`.
 
 ---
 
@@ -636,7 +637,7 @@ Read-only capability gate. Wymaga stabilnego `OL` i sprawdza m.in.:
 - `load.off.delay` / `load.on.delay`;
 - dostępność `upsdrvctl`.
 
-**Nie wysyła `shutdown.return`. Nie odcina zasilania.**
+**Nie wysyła `shutdown.return`, nie odcina zasilania i nie zmienia zapisanego capability gate.** Fingerprint zostaje utrwalony dopiero podczas świadomego `nut-config powercycle enable`. Dzięki temu samo `probe`/`status` po podmianie UPS-a nie może przepiąć autoryzacji power-cycle na nowe urządzenie.
 
 ## `nut-config powercycle status`
 
@@ -677,6 +678,8 @@ Uzbraja mechanizm power-cycle na przyszły prawdziwy FSD. Komenda:
 - robi rollback przy błędzie.
 
 **Samo `enable` nie wykonuje testowego `shutdown.return` i nie odcina wyjścia UPS.**
+
+`nut-config show` i `nut-config powercycle status` rozróżniają teraz **configured** od **runtime state** (`DISABLED`, `ARMED`, `PENDING_NOT_ARMED`). Po aktualizacji zapisane `ON` nie może pozostać myląco uzbrojone bez świeżej walidacji: jeśli urządzenia/statusu nie da się potwierdzić, aktualizacja fail-closed zapisuje power-cycle jako `OFF`.
 
 Komenda jest blokowana podczas BYPASS.
 
@@ -919,7 +922,6 @@ NUT_LISTEN_IP
 NUT_PORT
 SHUTDOWN_DELAY
 TIMED_SHUTDOWN
-LOWBATT_SHUTDOWN
 POLLFREQ
 POLLFREQALERT
 HOSTSYNC
@@ -1023,6 +1025,8 @@ Przed przywróceniem zawsze powstaje **dodatkowy backup bezpieczeństwa**. Resto
 
 Jeżeli wybrany backup miał aktywny power-cycle, skrypt przygotowuje fail-closed runtime przed przywróceniem, a po restarcie **ponownie** sprawdza capabilities i świeży fingerprint UPS. Jeśli walidacja po restore nie przejdzie, skrypt próbuje wrócić do backupu bezpieczeństwa zamiast pozostawiać niezweryfikowany power-cycle.
 
+Backup formatu RC1 zapisuje też, czy opcjonalne pliki istniały oraz osobno stan `active/enabled` dla `nut-monitor`, MQTT i health-watchdoga. Restore usuwa plik, który w danym backupie był nieobecny, zamiast przypadkiem zostawić nowszą konfigurację. `nut-monitor` jest przywracany dopiero po ponownym potwierdzeniu stabilnego `OL`; błąd restartu, walidacji **lub odtworzenia stanu usług** nie kończy się fałszywym `[OK]`. Starsze backupy bez manifestu pozostają obsługiwane w trybie zgodnościowym.
+
 ## `nut-config backup prune`
 
 ```bash
@@ -1111,13 +1115,14 @@ Wpisz dokładnie host, port, użytkownika i hasło pokazane przez `nut-ha-info`.
 
 Konto `homeassistant` nie dostaje `instcmds`, więc nie służy do sterowania UPS ani shutdownem hosta.
 
-Przykładowe automatyzacje znajdują się w:
+Przykłady są rozdzielone, żeby nie mieszać encji oficjalnej integracji z MQTT:
 
 ```text
-home-assistant/automations-example.yaml
+home-assistant/automations-nut-example.yaml
+home-assistant/automations-mqtt-example.yaml
 ```
 
-Po dodaniu integracji sprawdź rzeczywiste `entity_id` przed użyciem przykładów.
+`automations-example.yaml` pozostaje kopią zgodnościową przykładu dla oficjalnej integracji NUT. Po dodaniu integracji zawsze sprawdź rzeczywiste `entity_id` i stany encji przed użyciem przykładów.
 
 ---
 
@@ -1171,7 +1176,7 @@ Przykładowy wynik:
 
 ```text
 Q-Tronic Proxmox NUT PowerWalker
-Wersja lokalna: 1.0.0
+Wersja lokalna: 1.0.0-rc1
 Kanał update:   main
 Repo:           Q-Tronic/proxmox-nut-powerwalker
 ```
@@ -1272,6 +1277,13 @@ Ręczny bootstrap również jest blokowany podczas aktywnego BYPASS przez głów
 
 ---
 
+# Status wydania RC1
+
+`1.0.0-rc1` jest kandydatem do pierwszego stabilnego wydania. Statyczne CI może sprawdzić składnię, ShellCheck, YAML i inwarianty projektu, ale **nie zastępuje testu konkretnego firmware UPS**. Taga `v1.0.0` nie twórz przed przejściem testów sprzętowych `OL -> OB -> OL`, pełnego shutdownu i — jeżeli zostanie użyty — kontrolowanego power-cycle.
+
+Jeżeli utworzysz techniczny tag `v1.0.0-rc1`, workflow GitHub oznaczy go automatycznie jako **pre-release**. Kanał `stable` korzysta z `/releases/latest`, więc RC nie stanie się przypadkiem wydaniem stabilnym.
+
+
 # Zgodność
 
 Głównym urządzeniem docelowym jest **PowerWalker VI 2200 STL FR**. Projekt zna wariant USB `0764:0601`, ale nie zakłada, że każdy egzemplarz lub firmware będzie raportował identyczne możliwości.
@@ -1297,7 +1309,9 @@ Zalecana komenda po instalacji, aktualizacji, ponownym podłączeniu UPS i po ni
 nut-config test
 ```
 
-Kreator nie steruje zasilaniem UPS. Wymaga wyłączonego power-cycle, aktywnego `nut-monitor`, komunikacji i stabilnego `OL`. Jeżeli poziom baterii jest raportowany, wymaga co najmniej 30%. Przy aktywnym timerze wymaga też wystarczającego marginesu czasu i prowadzi użytkownika przez ręczne odłączenie wejścia UPS oraz szybki powrót do `OL`.
+Kreator nie steruje zasilaniem UPS. Wymaga wyłączonego power-cycle, aktywnego `nut-monitor`, włączonego timera, komunikacji i stabilnego `OL`. Jeżeli poziom baterii jest raportowany, wymaga co najmniej 30%. Wymaga co najmniej 45 s konfiguracji timera i prowadzi użytkownika przez ręczne odłączenie wejścia UPS oraz szybki powrót do `OL`.
+
+Po powrocie zasilania test **nie kończy się już tylko na zobaczeniu `OL`**. Sprawdza świeże logi `ONBATT`/`ONLINE`, odrzuca test przy `CANCEL-FAILED`, `TIMER` lub `FSD`, a gdy wersja NUT obsługuje `upssched -l`, dodatkowo potwierdza, że `shutdown_on_battery` zniknął z kolejki timerów. Dla starszych NUT używany jest mechanizm `CANCEL-TIMER ... timer_cancel_failed`, więc nieudane/anachroniczne anulowanie zostawia jawny ślad.
 
 ## Self-test baterii
 
@@ -1317,6 +1331,14 @@ Quick self-test jest dostępny tylko, gdy UPS jawnie raportuje odpowiednią kome
 
 To nadal jest funkcja zależna od konkretnego firmware. Pierwszy test wykonuj pod nadzorem.
 
+Jeżeli proces został brutalnie przerwany (`SIGKILL`, twardy reset) i `doctor` wykryje osierocone konto `qtronic-selftest`, użyj przy stabilnym `OL`:
+
+```bash
+nut-config selftest cleanup
+```
+
+Cleanup robi backup, usuwa wyłącznie zarezerwowaną sekcję self-test i restartuje `nut-server`. Aktualizacja/instalacja również usuwa taki osierocony wpis automatycznie.
+
 ## Read-only health watchdog
 
 ```bash
@@ -1326,7 +1348,7 @@ nut-config watchdog enable
 nut-config watchdog disable
 ```
 
-Timer jest instalowany, ale **domyślnie wyłączony**. Po włączeniu uruchamia kontrolę mniej więcej co 5 minut. Sprawdza spójność usług, komunikacji, BYPASS i runtime power-cycle oraz zapisuje problemy do journala.
+Timer jest instalowany, ale **domyślnie wyłączony**. Po włączeniu uruchamia kontrolę mniej więcej co 5 minut. Sprawdza spójność usług, lokalny nasłuch `127.0.0.1:3493`, komunikację, BYPASS, MQTT, osierocone konto self-test, zgodność `SHUTDOWNCMD` z power-cycle i runtime power-cycle oraz zapisuje problemy do journala.
 
 Watchdog **niczego automatycznie nie naprawia, nie restartuje i nie wysyła komend do UPS**.
 

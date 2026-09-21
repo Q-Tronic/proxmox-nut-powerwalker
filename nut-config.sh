@@ -33,7 +33,7 @@ LOGROTATE="/etc/logrotate.d/nut-powerwalker"
 LOCK="/run/lock/qtronic-nut-config.lock"
 BYPASS_STATE="/etc/nut/qtronic-bypass-state.env"
 MARKER="# managed-by: q-tronic-nut-powerwalker-installer"
-QTRONIC_VERSION="1.0.0"
+QTRONIC_VERSION="1.0.0-rc1"
 VERSION_FILE="${BASE}/VERSION"
 WATCHDOG_SERVICE="qtronic-nut-health.service"
 WATCHDOG_TIMER="qtronic-nut-health.timer"
@@ -141,11 +141,8 @@ derive_settings_from_current() {
         TIMED_SHUTDOWN=0
     fi
 
-    if grep -Eq '^[[:space:]]*AT[[:space:]]+LOWBATT[[:space:]]+\*[[:space:]]+EXECUTE[[:space:]]+emergency_shutdown' /etc/nut/upssched.conf 2>/dev/null; then
-        LOWBATT_SHUTDOWN=1
-    else
-        LOWBATT_SHUTDOWN=0
-    fi
+    # LOWBATT (OB+LB) jest natywną ochroną upsmon i nie jest przełącznikiem projektu.
+    LOWBATT_SHUTDOWN=1
 
     POLLFREQ="$(get_conf_value /etc/nut/upsmon.conf POLLFREQ 5)"
     POLLFREQALERT="$(get_conf_value /etc/nut/upsmon.conf POLLFREQALERT 5)"
@@ -192,7 +189,8 @@ load_settings() {
 
     SHUTDOWN_DELAY="${SHUTDOWN_DELAY:-60}"
     TIMED_SHUTDOWN="${TIMED_SHUTDOWN:-1}"
-    LOWBATT_SHUTDOWN="${LOWBATT_SHUTDOWN:-1}"
+    # Wartość zachowana tylko dla zgodności ze starszym settings.env; RC1 zawsze wymusza ochronę natywną.
+    LOWBATT_SHUTDOWN=1
 
     POLLFREQ="${POLLFREQ:-5}"
     POLLFREQALERT="${POLLFREQALERT:-5}"
@@ -227,7 +225,15 @@ validate_settings() {
     (( SHUTDOWN_DELAY >= 15 && SHUTDOWN_DELAY <= 86400 )) || die "SHUTDOWN_DELAY: 15-86400 s."
 
     is_bool "${TIMED_SHUTDOWN}" || die "TIMED_SHUTDOWN: 0/1."
-    is_bool "${LOWBATT_SHUTDOWN}" || die "LOWBATT_SHUTDOWN: 0/1."
+    [[ "${LOWBATT_SHUTDOWN}" == "1" ]] || die "LOWBATT jest natywną ochroną upsmon i musi pozostać aktywny."
+
+    [[ "${UPS_NAME}" =~ ^[A-Za-z0-9_.-]+$ ]] || die "UPS_NAME: dozwolone A-Z a-z 0-9 _ . -."
+    [[ "${UPS_PORT}" != *$'\n'* && "${UPS_PORT}" != *$'\r'* ]] || die "UPS_PORT nie może zawierać CR/LF."
+    [[ "${UPS_PORT}" =~ ^[A-Za-z0-9_./:+,@-]+$ ]] || die "UPS_PORT zawiera niedozwolone znaki."
+    [[ "${UPS_DESC}" != *$'\n'* && "${UPS_DESC}" != *$'\r'* ]] || die "UPS_DESC nie może zawierać CR/LF."
+    [[ "${UPS_DESC}" != *'"'* && "${UPS_DESC}" != *'\'* ]] || die "UPS_DESC nie może zawierać cudzysłowu ani backslasha."
+    [[ -z "${UPS_SUBDRIVER}" || "${UPS_SUBDRIVER}" =~ ^[-A-Za-z0-9_.+[:space:]]+$ ]] || die "UPS_SUBDRIVER zawiera niedozwolone znaki."
+    [[ "${UPSMON_ROLE}" == "primary" || "${UPSMON_ROLE}" == "master" ]] || die "UPSMON_ROLE: primary albo master."
 
     is_uint "${NUT_PORT}" || die "NUT_PORT nie jest liczbą."
     (( NUT_PORT >= 1 && NUT_PORT <= 65535 )) || die "NUT_PORT: 1-65535."
@@ -249,8 +255,6 @@ validate_settings() {
     is_hex4_or_empty "${UPS_PRODUCTID}" || die "UPS_PRODUCTID: 4 znaki hex albo puste."
 
     [[ "${UPS_DRIVER}" =~ ^[A-Za-z0-9_.+-]+$ ]] || die "Nieprawidłowy UPS_DRIVER."
-    [[ "${UPS_PORT}" != *$'\n'* ]] || die "Nieprawidłowy UPS_PORT."
-    [[ "${UPS_DESC}" != *$'\n'* ]] || die "UPS_DESC nie może zawierać nowej linii."
 
     is_log_size "${LOG_ROTATE_SIZE}" || die "LOG_ROTATE_SIZE np. 512k, 2M."
     is_uint "${LOG_ROTATE_COUNT}" || die "LOG_ROTATE_COUNT nie jest liczbą."
@@ -348,15 +352,11 @@ save_settings() {
 }
 
 require_safe_change_window() {
-    local active status
-    active="$(systemctl is-active nut-monitor.service 2>/dev/null || true)"
+    local status
     status="$(status_now || true)"
-
-    if [[ "${active}" == "active" ]]; then
-        [[ -n "${status}" ]] || die "nut-monitor jest aktywny, ale UPS nie odpowiada. Najpierw: nut-report"
-        printf '%s\n' "${status}" | grep -qw OL || die "UPS nie jest OL (${status}). Nie zmieniam konfiguracji podczas awarii."
-        ! printf '%s\n' "${status}" | grep -qw OB || die "UPS raportuje OB. Nie zmieniam konfiguracji podczas pracy z baterii."
-    fi
+    [[ -n "${status}" ]] || die "UPS nie odpowiada. Operacje renderujące/restartujące NUT wymagają stabilnego OL."
+    printf '%s\n' "${status}" | grep -qw OL || die "UPS nie jest OL (${status}). Nie zmieniam konfiguracji podczas awarii."
+    ! printf '%s\n' "${status}" | grep -qw OB || die "UPS raportuje OB. Nie zmieniam konfiguracji podczas pracy z baterii."
 }
 
 backup_list() {
@@ -420,7 +420,11 @@ backup_restore_cmd() {
 
     safety="$(backup_now 1)"
     info "Backup bezpieczeństwa przed restore: ${safety}"
-    restore_backup_dir "${target}"
+    if ! restore_backup_dir "${target}"; then
+        warn "Restore ${target} nie przeszedł walidacji. Próbuję wrócić do backupu bezpieczeństwa."
+        restore_backup_dir "${safety}" || warn "Rollback do backupu bezpieczeństwa również wymaga ręcznej kontroli."
+        return 11
+    fi
     load_settings
 
     if (( target_powercycle == 1 )); then
@@ -452,10 +456,11 @@ backup_restore_cmd() {
 }
 
 backup_now() {
-    local skip_prune="${1:-0}" d
+    local skip_prune="${1:-0}" d f unit
     d="$(mktemp -d "${CFG_BACKUPS}/config-$(date +%Y%m%d-%H%M%S)-XXXXXX")"
     chmod 0700 "${d}"
 
+    : > "${d}/file-state.txt"
     for f in \
         "${SETTINGS}" \
         /etc/nut/ups.conf \
@@ -468,14 +473,19 @@ backup_now() {
         /etc/nut/nut-mqtt.json \
         /etc/nut/qtronic-powercycle-capability.json; do
         if [[ -e "${f}" ]]; then
+            printf '%s\tpresent\n' "${f}" >> "${d}/file-state.txt"
             cp -a "${f}" "${d}/$(echo "${f}" | sed 's#^/##; s#/#__#g')"
+        else
+            printf '%s\tabsent\n' "${f}" >> "${d}/file-state.txt"
         fi
     done
 
-    {
-        echo "nut-monitor=$(systemctl is-active nut-monitor.service 2>/dev/null || true)"
-        echo "nut-mqtt=$(systemctl is-active nut-mqtt.service 2>/dev/null || true)"
-    } > "${d}/service-state.txt"
+    : > "${d}/service-state.txt"
+    for unit in nut-monitor.service nut-mqtt.service "${WATCHDOG_TIMER}"; do
+        printf '%s\tactive=%s\tenabled=%s\n' \
+            "${unit}" "$(service_active_bit "${unit}")" "$(service_enabled_bit "${unit}")" >> "${d}/service-state.txt"
+    done
+    printf 'format=2\n' > "${d}/backup-format.txt"
 
     printf '%s\n' "${d}" > "${BASE}/LAST_CONFIG_BACKUP"
     chmod 0600 "${BASE}/LAST_CONFIG_BACKUP"
@@ -508,36 +518,74 @@ restart_stack() {
 }
 
 restore_backup_dir() {
-    local d="$1" encoded target
-    [[ -d "${d}" ]] || die "Brak backupu ${d}"
+    local d="$1" encoded target status line unit active enabled
+    [[ -d "${d}" ]] || { warn "Brak backupu ${d}"; return 1; }
 
     systemctl stop nut-monitor.service 2>/dev/null || true
     systemctl stop nut-mqtt.service 2>/dev/null || true
+    systemctl stop "${WATCHDOG_TIMER}" 2>/dev/null || true
 
-    for encoded in \
-        "${d}"/etc__nut__* \
-        "${d}"/etc__logrotate.d__nut-powerwalker \
-        "${d}"/root__nut-powerwalker__credentials.env; do
-        [[ -e "${encoded}" ]] || continue
-        target="/${encoded##*/}"
-        target="${target//__/\/}"
-        mkdir -p "$(dirname "${target}")"
-        cp -a "${encoded}" "${target}"
-    done
-
-    restart_stack || true
-
-    if grep -q '^nut-monitor=active$' "${d}/service-state.txt" 2>/dev/null; then
-        systemctl enable --now nut-monitor.service 2>/dev/null || true
+    # Format v2 pamięta również brak opcjonalnych plików. Starsze backupy są odtwarzane zgodnościowo.
+    if [[ -f "${d}/file-state.txt" ]]; then
+        while IFS=$'\t' read -r target state; do
+            [[ -n "${target}" ]] || continue
+            encoded="${d}/$(echo "${target}" | sed 's#^/##; s#/#__#g')"
+            if [[ "${state}" == "present" ]]; then
+                [[ -e "${encoded}" ]] || { warn "Backup oznacza ${target} jako present, ale brak kopii."; return 2; }
+                mkdir -p "$(dirname "${target}")"
+                cp -a "${encoded}" "${target}" || return 2
+            elif [[ "${state}" == "absent" ]]; then
+                case "${target}" in
+                    /etc/nut/nut-mqtt.json|/etc/nut/qtronic-powercycle-capability.json|/etc/logrotate.d/nut-powerwalker)
+                        rm -f -- "${target}" || return 2 ;;
+                esac
+            fi
+        done < "${d}/file-state.txt"
     else
-        systemctl disable --now nut-monitor.service 2>/dev/null || true
+        for encoded in \
+            "${d}"/etc__nut__* \
+            "${d}"/etc__logrotate.d__nut-powerwalker \
+            "${d}"/root__nut-powerwalker__credentials.env; do
+            [[ -e "${encoded}" ]] || continue
+            target="/${encoded##*/}"
+            target="${target//__/\/}"
+            mkdir -p "$(dirname "${target}")"
+            cp -a "${encoded}" "${target}" || return 2
+        done
     fi
 
-    if grep -q '^nut-mqtt=active$' "${d}/service-state.txt" 2>/dev/null; then
-        systemctl enable --now nut-mqtt.service 2>/dev/null || true
+    if ! restart_stack; then
+        warn "Restart stosu NUT po restore nie powiódł się."
+        return 3
     fi
 
-    ok "Przywrócono backup: ${d}"
+    status="$(status_now || true)"
+    [[ -n "${status}" ]] || { warn "UPS nie odpowiada po restore; monitor pozostaje zatrzymany."; return 4; }
+    printf '%s\n' "${status}" | grep -qw OL || { warn "UPS po restore nie jest OL (${status}); monitor pozostaje zatrzymany."; return 4; }
+    ! printf '%s\n' "${status}" | grep -qw OB || { warn "UPS po restore raportuje OB; monitor pozostaje zatrzymany."; return 4; }
+
+    # Przywróć dokładny active/enabled dla v2. Stary format zachowuje dotychczasową zgodność.
+    if [[ -f "${d}/backup-format.txt" ]] && grep -qx 'format=2' "${d}/backup-format.txt"; then
+        while IFS=$'\t' read -r unit a e; do
+            active="${a#active=}"; enabled="${e#enabled=}"
+            is_bool "${active}" || { warn "Uszkodzony active dla ${unit}."; return 5; }
+            is_bool "${enabled}" || { warn "Uszkodzony enabled dla ${unit}."; return 5; }
+            restore_service_state "${unit}" "${active}" "${enabled}" || { warn "Nie udało się odtworzyć stanu ${unit}."; return 5; }
+        done < "${d}/service-state.txt"
+    else
+        if grep -q '^nut-monitor=active$' "${d}/service-state.txt" 2>/dev/null; then
+            restore_service_state nut-monitor.service 1 1 || return 5
+        else
+            restore_service_state nut-monitor.service 0 0 || return 5
+        fi
+        if grep -q '^nut-mqtt=active$' "${d}/service-state.txt" 2>/dev/null && [[ -f /etc/nut/nut-mqtt.json ]]; then
+            restore_service_state nut-mqtt.service 1 1 || return 5
+        else
+            restore_service_state nut-mqtt.service 0 0 || return 5
+        fi
+    fi
+
+    ok "Przywrócono backup i potwierdzono stabilne OL: ${d}"
 }
 
 render_temp() {
@@ -626,16 +674,15 @@ EOF_MON
 
         if [[ "${TIMED_SHUTDOWN}" == "1" ]]; then
             echo "AT ONBATT * START-TIMER shutdown_on_battery ${SHUTDOWN_DELAY}"
-            echo "AT ONLINE * CANCEL-TIMER shutdown_on_battery"
+            echo "AT ONLINE * CANCEL-TIMER shutdown_on_battery timer_cancel_failed"
         fi
 
         echo "AT ONLINE * EXECUTE power_restored"
         echo
 
         if [[ "${LOWBATT_SHUTDOWN}" == "1" ]]; then
-            [[ "${TIMED_SHUTDOWN}" == "1" ]] && echo "AT LOWBATT * CANCEL-TIMER shutdown_on_battery"
+            [[ "${TIMED_SHUTDOWN}" == "1" ]] && echo "AT LOWBATT * CANCEL-TIMER shutdown_on_battery timer_cancel_failed"
             echo "AT LOWBATT * EXECUTE low_battery"
-            echo "AT LOWBATT * EXECUTE emergency_shutdown"
         else
             echo "AT LOWBATT * EXECUTE low_battery"
         fi
@@ -793,9 +840,8 @@ case "${1:-}" in
         event_log "TIMER: ${SHUTDOWN_DELAY}s ciągłej pracy na baterii; rozpoczynam FSD."
         "${UPSMON}" -c fsd
         ;;
-    emergency_shutdown)
-        event_log "EMERGENCY: LOWBATT; rozpoczynam natychmiastowy FSD."
-        "${UPSMON}" -c fsd
+    timer_cancel_failed)
+        event_log "CANCEL-FAILED: timer shutdown_on_battery nie został anulowany przed wygaśnięciem."
         ;;
     fsd_started)
         event_log "FSD: rozpoczęto bezpieczne zamykanie hosta."
@@ -868,7 +914,7 @@ echo "Napięcie wyj.:   $(getv output.voltage) V"
 echo "------------------------------------------------------------"
 echo "Timed shutdown:  $([[ "${TIMED_SHUTDOWN}" == "1" ]] && echo ON || echo OFF)"
 echo "Shutdown delay:  ${SHUTDOWN_DELAY} s"
-echo "LOWBATT action:  $([[ "${LOWBATT_SHUTDOWN}" == "1" ]] && echo shutdown || echo log-only)"
+echo "LOWBATT action:  native upsmon (OB+LB => FSD)"
 echo "BYPASS:          $([[ -f /etc/nut/qtronic-bypass-state.env ]] && echo AKTYWNY || echo nie)"
 echo "------------------------------------------------------------"
 echo "nut-monitor:     $(systemctl is-active nut-monitor.service 2>/dev/null || true)"
@@ -1059,6 +1105,12 @@ install_self() {
     local had_settings=0 current_status
     [[ -f "${SETTINGS}" ]] && had_settings=1
 
+    # Po SIGKILL/twardym resecie nie zostawiamy zarezerwowanego konta self-test.
+    if selftest_user_present; then
+        warn "Wykryto osierocone konto ${SELFTEST_USER}; usuwam je podczas instalacji/aktualizacji."
+        remove_reserved_selftest_user
+    fi
+
     install -o root -g root -m 0755 "${SELF}" "${INSTALL_PATH}"
     ln -sf "${INSTALL_PATH}" /usr/local/sbin/nut-config
     ln -sf "${INSTALL_PATH}" /usr/local/sbin/nut-delay
@@ -1093,14 +1145,17 @@ install_self() {
                 install_powercycle_runtime
             else
                 warn "Zapisany power-cycle nie przechodzi capability gate na aktualnym sprzęcie."
-                warn "Pozostawiam ustawienie zapisane, ale nie uzbrajam runtime."
-                warn "Sprawdź: nut-config powercycle probe"
+                warn "Fail-closed: utrwalam POWERCYCLE_ENABLED=0 i nie uzbrajam runtime."
+                POWERCYCLE_ENABLED=0
+                save_settings
                 remove_powercycle_runtime
+                warn "Po stabilnym OL: nut-config powercycle probe ; nut-config powercycle enable"
             fi
         else
-            warn "Nie weryfikuję power-cycle podczas statusu ${current_status:-brak}."
-            warn "Ustawienie pozostaje zapisane, ale runtime nie jest teraz uzbrajany."
-            warn "Po stabilnym OL uruchom: nut-config apply"
+            warn "Nie można świeżo zweryfikować power-cycle podczas statusu ${current_status:-brak}."
+            warn "Fail-closed: utrwalam POWERCYCLE_ENABLED=0 i nie uzbrajam runtime."
+            POWERCYCLE_ENABLED=0
+            save_settings
             remove_powercycle_runtime
         fi
     else
@@ -1153,7 +1208,7 @@ UPS:
 Shutdown:
   czasowy:             $([[ "${TIMED_SHUTDOWN}" == "1" ]] && echo ON || echo OFF)
   delay:               ${SHUTDOWN_DELAY} s
-  LOWBATT shutdown:    $([[ "${LOWBATT_SHUTDOWN}" == "1" ]] && echo ON || echo OFF)
+  LOWBATT:             native upsmon (zawsze chronione)
 
 NUT:
   localhost:           127.0.0.1:3493 (stały control-plane)
@@ -1212,7 +1267,11 @@ set_key() {
             case "${value,,}" in on|1|yes|true) TIMED_SHUTDOWN=1 ;; off|0|no|false) TIMED_SHUTDOWN=0 ;; *) die "on/off" ;; esac
             ;;
         LOWBATT_SHUTDOWN)
-            case "${value,,}" in on|1|yes|true) LOWBATT_SHUTDOWN=1 ;; off|0|no|false) LOWBATT_SHUTDOWN=0 ;; *) die "on/off" ;; esac
+            case "${value,,}" in
+                on|1|yes|true) LOWBATT_SHUTDOWN=1; ok "LOWBATT jest natywnie chroniony przez upsmon; nic nie trzeba włączać."; return 0 ;;
+                off|0|no|false) die "Nie wyłączam natywnej ochrony LOWBATT (OB+LB => FSD)." ;;
+                *) die "Użyj: nut-config lowbatt status|on. Opcja off jest celowo zablokowana." ;;
+            esac
             ;;
         NUT_LISTEN_IP)
             case "${value,,}" in
@@ -1451,13 +1510,18 @@ powercycle_fingerprint() {
 }
 
 powercycle_probe() {
-    local quiet="${1:-0}"
+    local quiet="${1:-0}" commit="${2:-0}"
 
-    # Nie przeładowujemy tutaj settings. Probe ma sprawdzać sprzęt dla
-    # aktualnej transakcji konfiguracyjnej, bez kasowania zmian w pamięci.
-    local raw cmds rw status fp driver_name vendorid productid
+    # Probe jest read-only względem UPS i — domyślnie — także względem lokalnego
+    # capability gate. Tylko świadome powercycle enable używa commit=1.
+    # Dzięki temu zwykłe `powercycle probe/status` nie może przepiąć autoryzacji
+    # power-cycle na inne urządzenie przez samo odświeżenie fingerprintu.
+    is_bool "${quiet}" || die "Nieprawidłowy tryb quiet powercycle_probe."
+    is_bool "${commit}" || die "Nieprawidłowy tryb commit powercycle_probe."
+
+    local raw cmds rw status fp driver_name vendorid productid expected_fp="" fingerprint_ok=1
     local has_return=0 has_start=0 has_shutdown=0 has_off_delay=0 has_on_delay=0
-    local supported=0
+    local supported=0 gate_ok=0
 
     raw="$(upsc "$(local_target)" 2>&1 || true)"
     status="$(printf '%s\n' "${raw}" | sed -n 's/^ups.status: //p' | head -n1)"
@@ -1497,10 +1561,32 @@ powercycle_probe() {
         supported=1
     fi
 
-    python3 - "${CAPABILITY_FILE}" \
-        "${fp}" "${status}" "${driver_name}" "${vendorid}" "${productid}" \
-        "${has_return}" "${has_start}" "${has_shutdown}" \
-        "${has_off_delay}" "${has_on_delay}" "${supported}" <<'PY'
+    # Jeśli power-cycle jest już skonfigurowany jako ON, read-only probe musi
+    # potwierdzić TEN SAM fingerprint, który został świadomie zapisany przy enable.
+    if [[ "${POWERCYCLE_ENABLED:-0}" == "1" ]]; then
+        if [[ -r "${CAPABILITY_FILE}" ]]; then
+            expected_fp="$(jq -r '.fingerprint // empty' "${CAPABILITY_FILE}" 2>/dev/null || true)"
+            [[ -n "${expected_fp}" && "${fp}" == "${expected_fp}" ]] || fingerprint_ok=0
+        else
+            fingerprint_ok=0
+        fi
+    fi
+
+    if [[ "${supported}" == "1" && "${fingerprint_ok}" == "1" ]]; then
+        gate_ok=1
+    fi
+
+    if [[ "${commit}" == "1" ]]; then
+        # Commit jest dozwolony tylko dla kandydata, który przechodzi capability gate
+        # w bieżącym stanie. Używa go wyłącznie świadome powercycle enable.
+        [[ "${gate_ok}" == "1" ]] || {
+            [[ "${quiet}" == "1" ]] || echo "[NIE] Nie zapisuję capability gate dla niezweryfikowanego UPS."
+            return 1
+        }
+        python3 - "${CAPABILITY_FILE}" \
+            "${fp}" "${status}" "${driver_name}" "${vendorid}" "${productid}" \
+            "${has_return}" "${has_start}" "${has_shutdown}" \
+            "${has_off_delay}" "${has_on_delay}" "${supported}" <<'PY_CAPABILITY'
 import json, os, sys
 (
     path, fp, status, driver_name, vendorid, productid,
@@ -1526,8 +1612,9 @@ with open(tmp, "w", encoding="utf-8") as f:
     json.dump(data, f, indent=2)
 os.chmod(tmp, 0o640)
 os.replace(tmp, path)
-PY
-    chown root:nut "${CAPABILITY_FILE}" 2>/dev/null || true
+PY_CAPABILITY
+        chown root:nut "${CAPABILITY_FILE}" 2>/dev/null || true
+    fi
 
     if [[ "${quiet}" != "1" ]]; then
         echo "============================================================"
@@ -1538,6 +1625,9 @@ PY
         echo "USB VID:                 ${vendorid:-brak}"
         echo "USB PID:                 ${productid:-brak}"
         echo "fingerprint:             ${fp}"
+        if [[ "${POWERCYCLE_ENABLED:-0}" == "1" ]]; then
+            echo "fingerprint vs armed:    $([[ "${fingerprint_ok}" == "1" ]] && echo ZGODNY || echo NIEZGODNY)"
+        fi
         echo "shutdown.return:         $([[ "${has_return}" == "1" ]] && echo TAK || echo NIE)"
         echo "ups.delay.start R/W:     $([[ "${has_start}" == "1" ]] && echo TAK || echo NIE)"
         echo "ups.delay.shutdown R/W:  $([[ "${has_shutdown}" == "1" ]] && echo TAK || echo NIE)"
@@ -1545,16 +1635,20 @@ PY
         echo "load.on.delay:           $([[ "${has_on_delay}" == "1" ]] && echo TAK || echo NIE)"
         echo "upsdrvctl:               $(command -v upsdrvctl || echo BRAK)"
         echo "------------------------------------------------------------"
-        if [[ "${supported}" == "1" ]]; then
-            echo "WYNIK: POWER-CYCLE MOŻE ZOSTAĆ ODBLOKOWANY."
-            echo "Następny krok: nut-config powercycle enable"
+        if [[ "${gate_ok}" == "1" ]]; then
+            echo "WYNIK: POWER-CYCLE MOŻE ZOSTAĆ ODBLOKOWANY / POZOSTAJE ZWERYFIKOWANY."
+            [[ "${POWERCYCLE_ENABLED:-0}" == "1" ]] || echo "Następny krok: nut-config powercycle enable"
+        elif [[ "${supported}" == "1" && "${fingerprint_ok}" != "1" ]]; then
+            echo "WYNIK: SPRZĘT MA shutdown.return, ALE FINGERPRINT NIE PASUJE DO UZBROJONEGO UPS."
+            echo "Power-cycle pozostaje fail-closed. Jeśli świadomie zmieniłeś UPS: disable -> probe -> enable."
         else
             echo "WYNIK: POWER-CYCLE POZOSTAJE ZABLOKOWANY."
         fi
+        echo "Probe nie wysłał żadnej komendy UPS ani nie zmienił capability gate."
         echo "============================================================"
     fi
 
-    [[ "${supported}" == "1" ]]
+    [[ "${gate_ok}" == "1" ]]
 }
 
 install_powercycle_runtime() {
@@ -1695,13 +1789,29 @@ remove_powercycle_runtime() {
     systemctl daemon-reload >/dev/null 2>&1 || true
 }
 
+powercycle_runtime_state() {
+    if [[ "${POWERCYCLE_ENABLED}" != "1" ]]; then
+        echo "DISABLED"
+        return
+    fi
+    local cap="false" hook=0
+    [[ -r "${CAPABILITY_FILE}" ]] && cap="$(jq -r '.supported // false' "${CAPABILITY_FILE}" 2>/dev/null || true)"
+    [[ -x /usr/lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} || -x /lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} ]] && hook=1
+    if [[ "${cap}" == "true" && -x "${INSTALL_DIR}/qtronic-shutdown-wrapper.sh" && "${hook}" == "1" ]]; then
+        echo "ARMED"
+    else
+        echo "PENDING_NOT_ARMED"
+    fi
+}
+
 powercycle_status() {
     load_settings
 
     echo "============================================================"
     echo " Q-Tronic | power-cycle status"
     echo "============================================================"
-    echo "Enabled:           $([[ "${POWERCYCLE_ENABLED}" == "1" ]] && echo TAK || echo NIE)"
+    echo "Configured:        $([[ "${POWERCYCLE_ENABLED}" == "1" ]] && echo TAK || echo NIE)"
+    echo "Runtime state:     $(powercycle_runtime_state)"
     echo "OFF delay:         ${POWERCYCLE_OFFDELAY}s"
     echo "ON delay:          ${POWERCYCLE_ONDELAY}s"
     echo "Capability file:   $([[ -f "${CAPABILITY_FILE}" ]] && echo TAK || echo NIE)"
@@ -1719,7 +1829,7 @@ powercycle_enable() {
     require_safe_change_window
 
     echo "Sprawdzam konkretny aktualnie podłączony UPS..."
-    powercycle_probe 0 || die "Capability gate nie został spełniony."
+    powercycle_probe 0 1 || die "Capability gate nie został spełniony."
 
     local outer_backup detected_vid detected_pid
     outer_backup="$(backup_now)"
@@ -1890,19 +2000,21 @@ service_enabled_bit() {
 }
 
 restore_service_state() {
-    local unit="$1" was_active="$2" was_enabled="$3"
+    local unit="$1" was_active="$2" was_enabled="$3" rc=0
 
     if [[ "${was_enabled}" == "1" ]]; then
-        systemctl enable "${unit}" >/dev/null 2>&1 || true
+        systemctl enable "${unit}" >/dev/null 2>&1 || { warn "Nie udało się enable ${unit}."; rc=1; }
     else
-        systemctl disable "${unit}" >/dev/null 2>&1 || true
+        systemctl disable "${unit}" >/dev/null 2>&1 || { warn "Nie udało się disable ${unit}."; rc=1; }
     fi
 
     if [[ "${was_active}" == "1" ]]; then
-        systemctl start "${unit}" >/dev/null 2>&1 || true
+        systemctl start "${unit}" >/dev/null 2>&1 || { warn "Nie udało się start ${unit}."; rc=1; }
     else
-        systemctl stop "${unit}" >/dev/null 2>&1 || true
+        systemctl stop "${unit}" >/dev/null 2>&1 || { warn "Nie udało się stop ${unit}."; rc=1; }
     fi
+
+    return "${rc}"
 }
 
 bypass_mark_ready() {
@@ -2154,9 +2266,34 @@ doctor_cmd() {
         [[ -x /usr/lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} ]] && hook=/usr/lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME}
         [[ -x /lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} ]] && hook=/lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME}
         [[ -n "${hook}" ]] && doctor_pass "late hook power-cycle istnieje" || doctor_fail "power-cycle enabled, ale brak late hooka"
-        if [[ -r "${CAPABILITY_FILE}" ]]; then cap_supported="$(jq -r '.supported // false' "${CAPABILITY_FILE}" 2>/dev/null || true)"; [[ "${cap_supported}" == "true" ]] && doctor_pass "capability file potwierdza supported=true" || doctor_fail "capability file nie potwierdza power-cycle"; else doctor_fail "power-cycle enabled, ale brak capability file"; fi
-    else doctor_pass "power-cycle aktualnie wyłączony"; fi
+        if [[ -r "${CAPABILITY_FILE}" ]]; then
+            cap_supported="$(jq -r '.supported // false' "${CAPABILITY_FILE}" 2>/dev/null || true)"
+            [[ "${cap_supported}" == "true" ]] && doctor_pass "capability file potwierdza supported=true" || doctor_fail "capability file nie potwierdza power-cycle"
+            if [[ -n "${raw:-}" ]]; then
+                local doctor_expected_fp doctor_current_fp
+                doctor_expected_fp="$(jq -r '.fingerprint // empty' "${CAPABILITY_FILE}" 2>/dev/null || true)"
+                doctor_current_fp="$(powercycle_fingerprint "${raw}")"
+                [[ -n "${doctor_expected_fp}" && "${doctor_expected_fp}" == "${doctor_current_fp}" ]]                     && doctor_pass "fingerprint power-cycle pasuje do aktualnego UPS"                     || doctor_fail "fingerprint capability file nie pasuje do aktualnego UPS"
+            fi
+        else
+            doctor_fail "power-cycle enabled, ale brak capability file"
+        fi
+    else
+        doctor_pass "power-cycle aktualnie wyłączony"
+        if [[ -x "${INSTALL_DIR}/qtronic-shutdown-wrapper.sh" || -e "${POWERCYCLE_FLAG}" || -x /usr/lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} || -x /lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} ]]; then
+            doctor_fail "power-cycle disabled, ale pozostał jego runtime/flag"
+        else
+            doctor_pass "brak stale runtime power-cycle przy configured=OFF"
+        fi
+    fi
     if [[ -f /etc/nut/nut-mqtt.json ]]; then systemctl is-active --quiet nut-mqtt.service 2>/dev/null && doctor_pass "MQTT skonfigurowane i aktywne" || doctor_info "MQTT skonfigurowane, ale usługa nieaktywna"; else doctor_info "MQTT nieskonfigurowane (funkcja opcjonalna)"; fi
+    if bypass_active && systemctl is-active --quiet nut-mqtt.service 2>/dev/null; then doctor_fail "nut-mqtt działa podczas BYPASS"; fi
+    ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq '(^|:)127\.0\.0\.1:3493$|^127\.0\.0\.1:3493$' && doctor_pass "localhost 127.0.0.1:3493 nasłuchuje" || doctor_fail "brak nasłuchu 127.0.0.1:3493"
+    if selftest_user_present; then doctor_warn "osierocone konto ${SELFTEST_USER} w upsd.users; użyj: nut-config selftest cleanup"; else doctor_pass "brak osieroconego konta self-test"; fi
+    local shutdowncmd expected_shutdown
+    shutdowncmd="$(awk '$1=="SHUTDOWNCMD" {$1=""; sub(/^[[:space:]]+/,""); gsub(/^"|"$/,""); print; exit}' /etc/nut/upsmon.conf 2>/dev/null || true)"
+    if [[ "${POWERCYCLE_ENABLED}" == "1" ]]; then expected_shutdown="${INSTALL_DIR}/qtronic-shutdown-wrapper.sh"; else expected_shutdown="$(command -v shutdown) -h now"; fi
+    [[ "${shutdowncmd}" == "${expected_shutdown}" ]] && doctor_pass "SHUTDOWNCMD zgodny ze stanem power-cycle" || doctor_fail "SHUTDOWNCMD niezgodny: ${shutdowncmd:-brak}"
     tmp_cluster="$(mktemp /tmp/qtronic-pvecm.XXXXXX)"
     if command -v pvecm >/dev/null 2>&1 && pvecm status >"${tmp_cluster}" 2>/dev/null; then
         nodes="$(awk -F: '/^[[:space:]]*Nodes:/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "${tmp_cluster}")"
@@ -2169,15 +2306,37 @@ doctor_cmd() {
 }
 
 watchdog_run() {
-    local issues=0 status msg
+    local issues=0 status msg shutdowncmd expected_shutdown raw expected_fp current_fp
     if bypass_active; then
         if systemctl is-active --quiet nut-monitor.service 2>/dev/null; then logger -t Q-Tronic-NUT-Health "ALERT: nut-monitor aktywny podczas BYPASS"; issues=$((issues + 1)); fi
+        if systemctl is-active --quiet nut-mqtt.service 2>/dev/null; then logger -t Q-Tronic-NUT-Health "ALERT: nut-mqtt aktywny podczas BYPASS"; issues=$((issues + 1)); fi
         if [[ -x "${INSTALL_DIR}/qtronic-shutdown-wrapper.sh" || -e "${POWERCYCLE_FLAG}" || -x /usr/lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} || -x /lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} ]]; then logger -t Q-Tronic-NUT-Health "ALERT: runtime power-cycle istnieje podczas BYPASS"; issues=$((issues + 1)); fi
     else
         systemctl is-active --quiet nut-server.service 2>/dev/null || { logger -t Q-Tronic-NUT-Health "ALERT: nut-server nieaktywny"; issues=$((issues + 1)); }
         status="$(status_now || true)"; [[ -n "${status}" ]] || { logger -t Q-Tronic-NUT-Health "ALERT: brak komunikacji z UPS"; issues=$((issues + 1)); }
         systemctl is-active --quiet nut-monitor.service 2>/dev/null || { logger -t Q-Tronic-NUT-Health "ALERT: nut-monitor nieaktywny"; issues=$((issues + 1)); }
-        if [[ "${POWERCYCLE_ENABLED}" == "1" ]]; then [[ -x "${INSTALL_DIR}/qtronic-shutdown-wrapper.sh" ]] || { logger -t Q-Tronic-NUT-Health "ALERT: power-cycle enabled bez wrappera"; issues=$((issues + 1)); }; [[ -x /usr/lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} || -x /lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} ]] || { logger -t Q-Tronic-NUT-Health "ALERT: power-cycle enabled bez late hooka"; issues=$((issues + 1)); }; fi
+        shutdowncmd="$(awk '$1=="SHUTDOWNCMD" {$1=""; sub(/^[[:space:]]+/,""); gsub(/^"|"$/,""); print; exit}' /etc/nut/upsmon.conf 2>/dev/null || true)"
+        if [[ "${POWERCYCLE_ENABLED}" == "1" ]]; then
+            expected_shutdown="${INSTALL_DIR}/qtronic-shutdown-wrapper.sh"
+            [[ -x "${INSTALL_DIR}/qtronic-shutdown-wrapper.sh" ]] || { logger -t Q-Tronic-NUT-Health "ALERT: power-cycle enabled bez wrappera"; issues=$((issues + 1)); }
+            [[ -x /usr/lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} || -x /lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} ]] || { logger -t Q-Tronic-NUT-Health "ALERT: power-cycle enabled bez late hooka"; issues=$((issues + 1)); }
+            if [[ -r "${CAPABILITY_FILE}" ]]; then
+                raw="$(upsc "$(local_target)" 2>/dev/null || true)"
+                expected_fp="$(jq -r '.fingerprint // empty' "${CAPABILITY_FILE}" 2>/dev/null || true)"
+                current_fp="$(powercycle_fingerprint "${raw}")"
+                [[ -n "${expected_fp}" && "${expected_fp}" == "${current_fp}" ]] || { logger -t Q-Tronic-NUT-Health "ALERT: fingerprint power-cycle nie pasuje do aktualnego UPS"; issues=$((issues + 1)); }
+            else
+                logger -t Q-Tronic-NUT-Health "ALERT: power-cycle enabled bez capability file"; issues=$((issues + 1))
+            fi
+        else
+            expected_shutdown="$(command -v shutdown) -h now"
+            if [[ -x "${INSTALL_DIR}/qtronic-shutdown-wrapper.sh" || -e "${POWERCYCLE_FLAG}" || -x /usr/lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} || -x /lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} ]]; then
+                logger -t Q-Tronic-NUT-Health "ALERT: power-cycle disabled, ale pozostał runtime/flag"; issues=$((issues + 1))
+            fi
+        fi
+        [[ "${shutdowncmd}" == "${expected_shutdown}" ]] || { logger -t Q-Tronic-NUT-Health "ALERT: SHUTDOWNCMD niezgodny ze stanem power-cycle"; issues=$((issues + 1)); }
+        ss -lnt 2>/dev/null | awk '{print $4}' | grep -Eq '(^|:)127\.0\.0\.1:3493$|^127\.0\.0\.1:3493$' || { logger -t Q-Tronic-NUT-Health "ALERT: brak nasłuchu 127.0.0.1:3493"; issues=$((issues + 1)); }
+        selftest_user_present && { logger -t Q-Tronic-NUT-Health "ALERT: osierocone konto qtronic-selftest"; issues=$((issues + 1)); }
     fi
     if (( issues > 0 )); then msg="Q-Tronic watchdog wykrył ${issues} problem(y). Uruchom: nut-config doctor oraz nut-logs 100"; [[ "${1:-}" == "--timer" ]] || echo "${msg}"; return 1; fi
     [[ "${1:-}" == "--timer" ]] || echo "[OK] Watchdog: brak wykrytych niespójności."; return 0
@@ -2195,26 +2354,159 @@ watchdog_cmd() {
 }
 
 guided_outage_test() {
-    require_normal_mode; load_settings
-    local raw status charge max_ob=20 waited=0 answer
+    require_normal_mode
+    load_settings
+    local raw status charge max_ob=20 waited=0 answer event_line deadline queue="" new_events onbatt_ts onbatt_epoch
     [[ "${POWERCYCLE_ENABLED}" == "0" ]] || die "Najpierw wyłącz power-cycle: nut-config powercycle disable"
+    [[ "${TIMED_SHUTDOWN}" == "1" ]] || die "Prowadzony test CANCEL-TIMER wymaga włączonego timera: nut-config timed on"
     systemctl is-active --quiet nut-monitor.service 2>/dev/null || die "nut-monitor musi być aktywny do testu."
-    raw="$(upsc "$(local_target)" 2>&1 || true)"; status="$(printf '%s\n' "${raw}" | sed -n 's/^ups.status: //p' | head -n1)"
-    [[ -n "${status}" ]] || die "UPS nie odpowiada."; printf '%s\n' "${status}" | grep -qw OL || die "Test zaczynamy wyłącznie z OL. Status: ${status}"; ! printf '%s\n' "${status}" | grep -Eqw 'OB|LB' || die "UPS nie jest w bezpiecznym stanie: ${status}"
+    (( SHUTDOWN_DELAY >= 45 )) || die "Shutdown delay=${SHUTDOWN_DELAY}s jest za krótki do prowadzonego testu. Ustaw co najmniej 45 s."
+    (( SHUTDOWN_DELAY <= 900 )) || die "Test weryfikuje anulowanie do pierwotnego deadline. Dla testu ustaw czas <=900 s (np. 60), potem przywróć produkcyjny."
+
+    raw="$(upsc "$(local_target)" 2>&1 || true)"
+    status="$(printf '%s\n' "${raw}" | sed -n 's/^ups.status: //p' | head -n1)"
+    [[ -n "${status}" ]] || die "UPS nie odpowiada."
+    printf '%s\n' "${status}" | grep -qw OL || die "Test zaczynamy wyłącznie z OL. Status: ${status}"
+    ! printf '%s\n' "${status}" | grep -Eqw 'OB|LB' || die "UPS nie jest w bezpiecznym stanie: ${status}"
     charge="$(printf '%s\n' "${raw}" | sed -n 's/^battery.charge: //p' | head -n1)"
-    if [[ "${charge}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then python3 - "${charge}" <<'PY_CHARGE30' || die "Bateria ma mniej niż 30%. Naładuj UPS przed testem."
+    if [[ "${charge}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        python3 - "${charge}" <<'PY_CHARGE30' || die "Bateria ma mniej niż 30%. Naładuj UPS przed testem."
 import sys
 raise SystemExit(0 if float(sys.argv[1]) >= 30 else 1)
 PY_CHARGE30
     fi
-    if [[ "${TIMED_SHUTDOWN}" == "1" ]]; then (( SHUTDOWN_DELAY >= 45 )) || die "Shutdown delay=${SHUTDOWN_DELAY}s jest za krótki do prowadzonego testu. Ustaw co najmniej 45 s."; (( max_ob < SHUTDOWN_DELAY - 15 )) || max_ob=$((SHUTDOWN_DELAY - 15)); fi
+
+    (( max_ob < SHUTDOWN_DELAY - 15 )) || max_ob=$((SHUTDOWN_DELAY - 15))
     (( max_ob >= 10 )) || die "Za mały margines czasu do bezpiecznego testu."
-    echo "============================================================"; echo " PROWADZONY TEST OL -> OB -> OL (bez power-cycle)"; echo "============================================================"; echo "NIE odłączaj kabla serwera od UPS. Odłączysz tylko wejście 230 V UPS."; echo "Po wykryciu OB natychmiast przywróć 230 V. Okno kreatora: ${max_ob}s."; read -r -p "Wpisz TEST aby rozpocząć: " answer; [[ "${answer}" == "TEST" ]] || { echo "Anulowano."; return 0; }
-    echo "Odłącz teraz wejście 230 V UPS. Czekam maks. 120 s na OB..."; while (( waited < 120 )); do status="$(status_now || true)"; if printf '%s\n' "${status}" | grep -qw OB; then break; fi; sleep 1; waited=$((waited + 1)); done; printf '%s\n' "${status}" | grep -qw OB || die "Nie wykryto OB w 120 s. Przywróć zasilanie i sprawdź nut-status."
-    echo "[OK] Wykryto OB. PODŁĄCZ TERAZ 230 V UPS Z POWROTEM."; waited=0
-    while (( waited < max_ob )); do status="$(status_now || true)"; if printf '%s\n' "${status}" | grep -qw OL && ! printf '%s\n' "${status}" | grep -qw OB; then break; fi; printf '%s\n' "${status}" | grep -qw LB && warn "LOWBATT — przywróć 230 V NATYCHMIAST."; printf '\rCzekam na OL... %2d/%2d s ' "$((waited + 1))" "${max_ob}"; sleep 1; waited=$((waited + 1)); done; echo
-    if ! printf '%s\n' "${status}" | grep -qw OL || printf '%s\n' "${status}" | grep -qw OB; then warn "Nie wykryto OL w bezpiecznym oknie. Przywróć 230 V natychmiast; rzeczywisty timer NUT może nadal działać."; return 3; fi
-    echo "[OK] OL wróciło. Czekam 5 s..."; sleep 5; status="$(status_now || true)"; if printf '%s\n' "${status}" | grep -qw OL && ! printf '%s\n' "${status}" | grep -qw OB; then ok "Test OL -> OB -> OL zakończony poprawnie."; tail -n 20 "${LOG_DIR}/events.log" 2>/dev/null || true; return 0; fi; die "Po stabilizacji UPS nie jest OL: ${status:-brak}"
+    event_line="$(wc -l < "${LOG_DIR}/events.log" 2>/dev/null || echo 0)"
+    echo "============================================================"
+    echo " PROWADZONY TEST OL -> OB -> OL + WERYFIKACJA CANCEL-TIMER"
+    echo "============================================================"
+    echo "NIE odłączaj kabla serwera od UPS. Odłączysz tylko wejście 230 V UPS."
+    echo "Po wykryciu OB natychmiast przywróć 230 V. Okno na powrót: ${max_ob}s."
+    echo "Po OL test będzie obserwował system aż minie pierwotny deadline ${SHUTDOWN_DELAY}s."
+    read -r -p "Wpisz TEST aby rozpocząć: " answer
+    [[ "${answer}" == "TEST" ]] || { echo "Anulowano."; return 0; }
+
+    echo "Odłącz teraz wejście 230 V UPS. Czekam maks. 120 s na OB..."
+    while (( waited < 120 )); do
+        status="$(status_now || true)"
+        if printf '%s\n' "${status}" | grep -qw OB; then break; fi
+        sleep 1; waited=$((waited + 1))
+    done
+    printf '%s\n' "${status}" | grep -qw OB || die "Nie wykryto OB w 120 s. Przywróć zasilanie i sprawdź nut-status."
+    echo "[OK] Wykryto OB. PODŁĄCZ TERAZ 230 V UPS Z POWROTEM."
+    waited=0
+    while (( waited < max_ob )); do
+        status="$(status_now || true)"
+        if printf '%s\n' "${status}" | grep -qw OL && ! printf '%s\n' "${status}" | grep -qw OB; then break; fi
+        printf '%s\n' "${status}" | grep -qw LB && { warn "LOWBATT — natywne upsmon może rozpocząć FSD. Przywróć 230 V NATYCHMIAST."; return 4; }
+        printf '\rCzekam na OL... %2d/%2d s ' "$((waited + 1))" "${max_ob}"
+        sleep 1; waited=$((waited + 1))
+    done
+    echo
+    if ! printf '%s\n' "${status}" | grep -qw OL || printf '%s\n' "${status}" | grep -qw OB; then
+        warn "Nie wykryto OL w bezpiecznym oknie. Przywróć 230 V natychmiast; rzeczywisty timer NUT może nadal działać."
+        return 3
+    fi
+
+    sleep 2
+    new_events="$(tail -n +$((event_line + 1)) "${LOG_DIR}/events.log" 2>/dev/null || true)"
+    printf '%s\n' "${new_events}" | grep -q 'ONBATT:' || { warn "Brak świeżego wpisu ONBATT w events.log."; return 5; }
+    printf '%s\n' "${new_events}" | grep -q 'ONLINE:' || { warn "Brak świeżego wpisu ONLINE w events.log."; return 5; }
+
+    # Deadline liczony od faktycznego wpisu ONBATT, a nie od chwili kiedy polling go zauważył.
+    onbatt_ts="$(printf '%s\n' "${new_events}" | sed -n 's/^\([^|]*\) | ONBATT:.*/\1/p' | head -n1 | sed 's/[[:space:]]*$//')"
+    onbatt_epoch="$(date -d "${onbatt_ts}" +%s 2>/dev/null || true)"
+    if [[ "${onbatt_epoch}" =~ ^[0-9]+$ ]]; then
+        deadline=$((onbatt_epoch + SHUTDOWN_DELAY + 10))
+    else
+        warn "Nie udało się sparsować czasu ONBATT; używam konserwatywnego pełnego okna od teraz."
+        deadline=$(($(date +%s) + SHUTDOWN_DELAY + 10))
+    fi
+    if printf '%s\n' "${new_events}" | grep -Eq 'CANCEL-FAILED:|TIMER:|FSD:'; then
+        warn "Log pokazuje nieudane anulowanie/timer/FSD. Test NIE przeszedł."
+        printf '%s\n' "${new_events}"
+        return 6
+    fi
+
+    # Nowsze NUT potrafią wypisać kolejkę timerów. Jeśli opcja istnieje, timer ma już zniknąć.
+    if upssched -h 2>&1 | grep -Eq '(^|[[:space:]])-l([[:space:]]|,|$)'; then
+        queue="$(upssched -l 2>/dev/null || true)"
+        if printf '%s\n' "${queue}" | grep -Eq '^shutdown_on_battery([[:space:]]|$)'; then
+            warn "shutdown_on_battery nadal jest w kolejce upssched po ONLINE."
+            return 7
+        fi
+        echo "[OK] upssched -l: shutdown_on_battery nie jest już w kolejce."
+    else
+        echo "[INFO] Ta wersja upssched nie ma -l; weryfikuję przez fallback CANCEL-TIMER i przeżycie deadline."
+    fi
+
+    echo "[OK] OL wróciło. Czekam do deadline timera liczonego od zdarzenia ONBATT (+10 s), aby wykluczyć opóźnione FSD..."
+    while (( $(date +%s) < deadline )); do
+        status="$(status_now || true)"
+        if ! printf '%s\n' "${status}" | grep -qw OL || printf '%s\n' "${status}" | grep -qw OB; then
+            warn "UPS przestał być stabilnie OL podczas okna weryfikacji: ${status:-brak}."
+            return 8
+        fi
+        new_events="$(tail -n +$((event_line + 1)) "${LOG_DIR}/events.log" 2>/dev/null || true)"
+        if printf '%s\n' "${new_events}" | grep -Eq 'CANCEL-FAILED:|TIMER:|FSD:'; then
+            warn "Po powrocie OL pojawił się CANCEL-FAILED/TIMER/FSD. Test NIE przeszedł."
+            printf '%s\n' "${new_events}"
+            return 9
+        fi
+        sleep 2
+    done
+    ok "Test OL -> OB -> OL zakończony poprawnie: timer nie wywołał FSD do pierwotnego deadline."
+    tail -n 30 "${LOG_DIR}/events.log" 2>/dev/null || true
+}
+
+selftest_user_present() {
+    [[ -r /etc/nut/upsd.users ]] || return 1
+    grep -Eq "^[[:space:]]*\[${SELFTEST_USER}\][[:space:]]*$" /etc/nut/upsd.users
+}
+
+remove_reserved_selftest_user() {
+    local src="/etc/nut/upsd.users" tmp
+    [[ -r "${src}" ]] || return 0
+    selftest_user_present || return 0
+    tmp="$(mktemp /tmp/qtronic-upsusers-clean.XXXXXX)"
+    python3 - "${src}" "${tmp}" "${SELFTEST_USER}" <<'PY_SELFTEST_CLEAN'
+import re, sys
+src, dst, user = sys.argv[1:]
+lines = open(src, encoding="utf-8", errors="replace").read().splitlines(True)
+out=[]; skip=False
+hdr=re.compile(r"^\s*\[([^]]+)\]\s*$")
+for line in lines:
+    m=hdr.match(line.rstrip("\r\n"))
+    if m:
+        skip=(m.group(1)==user)
+        if skip:
+            continue
+    if not skip:
+        out.append(line)
+open(dst,"w",encoding="utf-8").writelines(out)
+PY_SELFTEST_CLEAN
+    install -o root -g nut -m 0640 "${tmp}" "${src}"
+    rm -f "${tmp}"
+}
+
+selftest_cleanup() {
+    require_normal_mode
+    load_settings
+    load_creds
+    require_safe_change_window
+    if ! selftest_user_present; then
+        ok "Brak osieroconego konta ${SELFTEST_USER}."
+        return 0
+    fi
+    local backup
+    backup="$(backup_now)"
+    remove_reserved_selftest_user
+    systemctl restart nut-server.service || die "Nie udało się zrestartować nut-server po cleanup. Backup: ${backup}"
+    sleep 1
+    status_now >/dev/null || die "Po cleanup UPS nie odpowiada. Backup: ${backup}"
+    ok "Usunięto osierocone konto ${SELFTEST_USER}. Backup: ${backup}"
 }
 
 selftest_probe() {
@@ -2300,7 +2592,7 @@ EOF_AUTH
     echo "Tymczasowe konto z instcmds zostało usunięte. Backup: ${backup}"
 }
 
-selftest_cmd() { local sub="${1:-probe}"; shift || true; case "${sub}" in probe|status) selftest_probe ;; quick) selftest_quick "${1:-}" ;; *) die "nut-config selftest probe|quick TESTUJ" ;; esac; }
+selftest_cmd() { local sub="${1:-probe}"; shift || true; case "${sub}" in probe|status) selftest_probe ;; quick) selftest_quick "${1:-}" ;; cleanup) selftest_cleanup ;; *) die "nut-config selftest probe|quick TESTUJ|cleanup" ;; esac; }
 
 version_cmd() { load_settings; echo "Q-Tronic Proxmox NUT PowerWalker"; echo "Wersja lokalna: ${QTRONIC_VERSION}"; echo "Kanał update:   ${UPDATE_CHANNEL}"; echo "Repo:           Q-Tronic/proxmox-nut-powerwalker"; }
 
@@ -2436,6 +2728,9 @@ SELF-TEST BATERII — WARUNKOWY
       Quick test tylko przy OL, baterii >=50% (jeśli raportowana), power-cycle OFF i jawnej
       komendzie urządzenia. Używa chwilowego konta NUT o minimalnym instcmds i usuwa je po komendzie.
 
+  nut-config selftest cleanup
+      Usuwa wyłącznie osierocone konto qtronic-selftest po przerwanym teście. Wymaga stabilnego OL i tworzy backup.
+
 WATCHDOG READ-ONLY
   nut-config watchdog status
   nut-config watchdog enable
@@ -2493,11 +2788,14 @@ SHUTDOWN
   nut-config timed off
       Wyłącza shutdown czasowy. LOWBATT może nadal wywołać natychmiastowy FSD.
 
+  nut-config lowbatt status
+      Pokazuje zasadę RC1: LOWBATT (OB+LB) jest natywnie obsługiwany przez upsmon i nie jest wyłączalny przez projekt.
+
   nut-config lowbatt on
-      Włącza natychmiastowy FSD po zdarzeniu LOWBATT. Zalecane ustawienie.
+      Zgodnościowy no-op: potwierdza, że natywna ochrona LOWBATT pozostaje aktywna.
 
   nut-config lowbatt off
-      Wyłącza reakcję shutdown na LOWBATT i pozostawia tylko logowanie. Używaj świadomie.
+      Celowo odrzucane. Projekt nie oferuje wyłączenia natywnej ochrony OB+LB.
 
 BYPASS — BEZPIECZNE FIZYCZNE ODŁĄCZENIE UPS
   nut-config bypass status
@@ -2545,7 +2843,9 @@ MONITOR NUT
 POWER-CYCLE UPS
   nut-config powercycle probe
       Tylko odczyt. Sprawdza bieżący UPS, status OL, fingerprint, listę komend i m.in.
-      shutdown.return. Niczego nie odcina i nie wysyła shutdown.return.
+      shutdown.return. Niczego nie odcina, nie wysyła shutdown.return i nie nadpisuje
+      zapisanego capability/fingerprintu. Capability gate jest utrwalany dopiero przez
+      świadome: nut-config powercycle enable.
 
   nut-config powercycle status
       Pokazuje konfigurację power-cycle, obecność capability file, flagi FSD i hooka,
@@ -2710,7 +3010,7 @@ menu_header() {
     echo "Power-cycle:     $([[ "${POWERCYCLE_ENABLED}" == "1" ]] && echo WŁĄCZONY || echo wyłączony)"
     echo "BYPASS:          ${bypass}"
     echo "Shutdown timer:  $([[ "${TIMED_SHUTDOWN}" == "1" ]] && echo "ON (${SHUTDOWN_DELAY}s)" || echo OFF)"
-    echo "LOWBATT:         $([[ "${LOWBATT_SHUTDOWN}" == "1" ]] && echo shutdown || echo tylko-log)"
+    echo "LOWBATT:         native upsmon (OB+LB => FSD)"
     echo "============================================================"
     if [[ -z "${status}" ]]; then
         echo "!!! BRAK KOMUNIKACJI Z UPS — nie zmieniaj konfiguracji ani okablowania w ciemno."
@@ -2729,20 +3029,19 @@ menu_shutdown() {
         load_settings
         echo
         echo "--- Shutdown ---"
-        echo "Aktualnie: timer=$([[ "${TIMED_SHUTDOWN}" == "1" ]] && echo ON || echo OFF), delay=${SHUTDOWN_DELAY}s, LOWBATT=$([[ "${LOWBATT_SHUTDOWN}" == "1" ]] && echo ON || echo OFF)"
+        echo "Aktualnie: timer=$([[ "${TIMED_SHUTDOWN}" == "1" ]] && echo ON || echo OFF), delay=${SHUTDOWN_DELAY}s"
+        echo "LOWBATT: natywna ochrona upsmon (OB+LB => FSD), nie jest wyłączalna przez projekt."
         echo "1) Zmień czas do shutdownu"
         echo "2) Włącz shutdown czasowy"
         echo "3) Wyłącz shutdown czasowy"
-        echo "4) Włącz natychmiastowy shutdown LOWBATT (zalecane)"
-        echo "5) Wyłącz shutdown LOWBATT (zmniejsza ochronę)"
+        echo "4) Wyjaśnij LOWBATT"
         echo "0) Wróć"
         read -r -p "Wybór: " v
         case "${v}" in
             1) read -r -p "Nowy czas, np. 90 / 2m / 1h: " d; set_key SHUTDOWN_DELAY "${d}"; menu_pause ;;
             2) set_key TIMED_SHUTDOWN on; menu_pause ;;
             3) if menu_confirm_word WYLACZ "Serwer NIE wyłączy się po samym upływie czasu ONBATT."; then set_key TIMED_SHUTDOWN off; else echo "Anulowano."; fi; menu_pause ;;
-            4) set_key LOWBATT_SHUTDOWN on; menu_pause ;;
-            5) if menu_confirm_word WYLACZ "LOWBATT przestanie wymuszać awaryjny shutdown."; then set_key LOWBATT_SHUTDOWN off; else echo "Anulowano."; fi; menu_pause ;;
+            4) echo "LOWBATT/OB+LB jest stanem krytycznym obsługiwanym przez upsmon. Projekt go nie wyłącza."; menu_pause ;;
             0) return ;;
             *) echo "Nieprawidłowy wybór."; menu_pause ;;
         esac
@@ -2890,8 +3189,13 @@ case "${cmd}" in
         set_key TIMED_SHUTDOWN "$1"
         ;;
     lowbatt)
-        [[ $# -eq 1 ]] || die "nut-config lowbatt on|off"
-        set_key LOWBATT_SHUTDOWN "$1"
+        [[ $# -eq 1 ]] || die "nut-config lowbatt status|on|off"
+        case "${1,,}" in
+            status) echo "LOWBATT: native upsmon; OB+LB => krytyczny FSD. Projekt nie pozwala wyłączyć tej ochrony." ;;
+            on) echo "LOWBATT: ochrona natywna upsmon jest aktywna; no-op zgodnościowy." ;;
+            off) die "LOWBATT off jest celowo zablokowane: upsmon chroni host przy OB+LB." ;;
+            *) die "nut-config lowbatt status|on|off" ;;
+        esac
         ;;
     listen)
         if [[ $# -eq 0 ]]; then

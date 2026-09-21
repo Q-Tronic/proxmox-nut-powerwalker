@@ -1,30 +1,34 @@
 # Changelog
 
-## 1.0.0 - 2026-09-21
+## 1.0.0-rc1 — 2026-09-21
 
-Pierwsze wersjonowane wydanie publiczne.
+Finalny kandydat przed testami na fizycznym PowerWalkerze.
 
-### Safety
-- `nut-config doctor` z wynikami `PASS / WARN / FAIL`;
-- prowadzony, ograniczony czasowo test `OL -> OB -> OL`;
-- tryb BYPASS i bezpieczny `resume` pozostają integralną częścią ochrony;
-- dodatkowe zabezpieczenie restore backupu z aktywnym power-cycle: fail-closed runtime przed restore, świeży capability probe po restarcie i rollback bezpieczeństwa przy błędzie;
-- warunkowy quick self-test baterii z minimalnym tymczasowym kontem NUT;
-- opcjonalny read-only health watchdog; domyślnie wyłączony;
-- ostrzeżenie o wielowęzłowym klastrze Proxmox w `doctor`;
-- `nut-report --public` z best-effort redakcją danych identyfikujących.
+### Safety / correctness
 
-### Operations
-- `VERSION` i `nut-config version`;
-- kanały aktualizacji `main` / `stable`;
-- `nut-config update --check` i `--force`;
-- historia backupów: create/list/restore/prune oraz konfigurowalna retencja;
-- rozszerzone menu i `nut-config help`.
+- LOWBATT/`OB+LB` pozostawiono natywnemu mechanizmowi `upsmon`; usunięto redundantny własny `emergency_shutdown` i możliwość sugerowania, że tę ochronę można wyłączyć.
+- `CANCEL-TIMER shutdown_on_battery` dostał fallback `timer_cancel_failed`; prowadzony test `OL -> OB -> OL` sprawdza logi i, gdy dostępne, `upssched -l`.
+- Operacje renderujące/restartujące konfigurację wymagają stabilnego `OL` niezależnie od stanu `nut-monitor`.
+- Backup v2 zapisuje obecność/brak plików i osobne stany `active/enabled` monitora, MQTT i health-watchdoga.
+- Restore fail-closed: błąd restartu/walidacji lub odtworzenia stanu usług propaguje się, monitor wraca tylko po potwierdzonym `OL`, a nieudany restore próbuje wrócić do backupu bezpieczeństwa.
+- Power-cycle rozróżnia stan skonfigurowany od faktycznie uzbrojonego runtime (`DISABLED` / `ARMED` / `PENDING_NOT_ARMED`). Aktualizacja bez możliwości świeżej walidacji utrwala `POWERCYCLE_ENABLED=0`.
+- `powercycle probe/status` nie nadpisuje już zapisanego capability fingerprintu; nowy fingerprint może zostać utrwalony wyłącznie podczas świadomego `powercycle enable`, więc samo sprawdzenie po podmianie UPS-a nie przepina autoryzacji.
+- Dodatkowa walidacja `UPS_NAME`, `UPS_PORT`, `UPS_SUBDRIVER`, opisu i `UPSMON_ROLE`.
+- `doctor` i watchdog sprawdzają lokalny nasłuch 127.0.0.1:3493, MQTT w BYPASS, zgodność `SHUTDOWNCMD` z power-cycle, bieżący fingerprint UPS, stale runtime i osierocone konto self-test.
+- Dodano `nut-config selftest cleanup`; instalacja/aktualizacja usuwa zarezerwowane osierocone konto self-test.
+- `install.sh` poprawnie przechwytuje kody błędów setupu i konfiguratora mimo `set -e`.
 
-### Repository quality
-- GitHub Actions CI;
-- sprawdzanie Bash, ShellCheck, osadzonego Pythona i YAML;
-- kontrola zgodności `VERSION` z kodem;
-- kontrola dokumentacji publicznych komend;
-- tag-driven GitHub Releases dla tagów `vX.Y.Z`;
-- rozbudowana dokumentacja README.
+### Home Assistant
+
+- Rozdzielono przykłady na `automations-nut-example.yaml` (oficjalna integracja NUT) i `automations-mqtt-example.yaml` (MQTT Discovery).
+- Tag z sufiksem pre-release (np. `v1.0.0-rc1`) jest automatycznie publikowany jako GitHub **pre-release**, dzięki czemu nie zasila kanału `stable`.
+- `automations-example.yaml` pozostaje kopią zgodnościową przykładu oficjalnej integracji NUT.
+
+### CI / docs
+
+- Rozszerzono `tests/ci-check.py` o inwarianty LOWBATT, CANCEL-TIMER, backup v2, safe-change, power-cycle runtime, cleanup self-test i rozdzielenie przykładów HA.
+- README i `nut-config help` opisują zachowanie RC1 i nowe zabezpieczenia.
+
+## 1.0.0 — pre-release baseline
+
+Pierwszy zestaw funkcji Quality & Safety przygotowany przed audytem RC1: BYPASS, guarded power-cycle, doctor, guided test, backupy, public report, watchdog, self-test framework, wersjonowanie, kanały aktualizacji, GitHub CI i Release workflow.

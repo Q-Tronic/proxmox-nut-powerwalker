@@ -95,6 +95,14 @@ case "${NUT_PORT}" in
 esac
 (( NUT_PORT >= 1 && NUT_PORT <= 65535 )) || die "NUT_PORT poza zakresem 1-65535."
 
+[[ "${UPS_NAME}" =~ ^[A-Za-z0-9_.-]+$ ]] || die "UPS_NAME: dozwolone A-Z a-z 0-9 _ . -."
+[[ "${UPS_DESC}" != *$'\n'* && "${UPS_DESC}" != *$'\r'* && "${UPS_DESC}" != *'"'* && "${UPS_DESC}" != *'\'* ]]     || die "UPS_DESC nie może zawierać CR/LF, cudzysłowu ani backslasha."
+[[ -z "${UPS_DRIVER}" || "${UPS_DRIVER}" =~ ^[A-Za-z0-9_.+-]+$ ]] || die "Nieprawidłowy UPS_DRIVER."
+[[ -z "${UPS_PORT}" || "${UPS_PORT}" =~ ^[A-Za-z0-9_./:+,@-]+$ ]] || die "UPS_PORT zawiera niedozwolone znaki."
+[[ -z "${UPS_SUBDRIVER}" || "${UPS_SUBDRIVER}" =~ ^[-A-Za-z0-9_.+[:space:]]+$ ]] || die "UPS_SUBDRIVER zawiera niedozwolone znaki."
+[[ -z "${UPS_VENDORID}" || "${UPS_VENDORID}" =~ ^[0-9A-Fa-f]{4}$ ]] || die "UPS_VENDORID musi mieć 4 znaki hex."
+[[ -z "${UPS_PRODUCTID}" || "${UPS_PRODUCTID}" =~ ^[0-9A-Fa-f]{4}$ ]] || die "UPS_PRODUCTID musi mieć 4 znaki hex."
+
 mkdir -p "${BASE_DIR}" "${BACKUP_ROOT}" "${REPORT_DIR}" "${LIB_DIR}"
 chmod 0700 "${BASE_DIR}" "${BACKUP_ROOT}" "${REPORT_DIR}"
 chmod 0755 "${LIB_DIR}"
@@ -328,8 +336,10 @@ exact = [
     and normhex(c.get("productid")) == "0601"
 ]
 
-if exact:
-    exact.sort(key=score, reverse=True)
+if len(exact) > 1:
+    result["ambiguous"] = True
+    result["reason"] = "wiele urządzeń z tym samym znanym USB ID 0764:0601"
+elif len(exact) == 1:
     selected = exact[0]
     reason = "nut-scanner: dokładny USB ID 0764:0601"
 elif len(candidates) == 1:
@@ -344,7 +354,11 @@ elif len(candidates) > 1:
         result["ambiguous"] = True
         result["reason"] = "wiele równie prawdopodobnych urządzeń UPS"
 else:
-    if re.search(r"\b0764:0601\b", usbtext, re.I):
+    known_usb_count = len(re.findall(r"\b0764:0601\b", usbtext, re.I))
+    if known_usb_count > 1:
+        result["ambiguous"] = True
+        result["reason"] = "lsusb: więcej niż jedno urządzenie 0764:0601; odłącz dodatkowy UPS przed konfiguracją"
+    elif known_usb_count == 1:
         selected = {
             "driver": "usbhid-ups",
             "port": "auto",
@@ -378,14 +392,21 @@ AUTO_PRODUCTID="$("${JQ_BIN}" -r '.productid // empty' "${DETECTION_JSON}")"
 AUTO_SUBDRIVER="$("${JQ_BIN}" -r '.subdriver // empty' "${DETECTION_JSON}")"
 DETECTION_REASON="$("${JQ_BIN}" -r '.reason // "nieznany"' "${DETECTION_JSON}")"
 
-if [[ "${DETECTION_AMBIGUOUS}" == "true" ]] \
-   && [[ -z "${UPS_DRIVER}${UPS_VENDORID}${UPS_PRODUCTID}" ]]; then
+if [[ "${DETECTION_AMBIGUOUS}" == "true" ]]; then
     warn "Wykryto wiele równie prawdopodobnych UPS-ów USB."
     warn "Nie będę zgadywał, który ma sterować shutdownem."
+    warn "Powód: ${DETECTION_REASON}"
     warn "Zapisano: ${SCANNER_FILE}"
-    warn "Uruchom później np.:"
-    warn "UPS_DRIVER=usbhid-ups UPS_VENDORID=0764 UPS_PRODUCTID=0601 bash $0"
-    exit 20
+
+    if [[ "${DETECTION_REASON}" == *"0764:0601"* ]]; then
+        die "Wykryto kilka urządzeń z tym samym USB ID 0764:0601. Sam VID/PID nie rozróżni bezpiecznie egzemplarzy. Odłącz dodatkowe UPS-y i uruchom instalator ponownie."
+    fi
+
+    if [[ -z "${UPS_DRIVER}${UPS_VENDORID}${UPS_PRODUCTID}" ]]; then
+        warn "Dla różnych urządzeń możesz podać jednoznaczny driver/VID/PID ręcznie."
+        exit 20
+    fi
+    warn "Kontynuuję wyłącznie dlatego, że podano ręczne parametry UPS. Po instalacji koniecznie sprawdź nut-status i nut-report."
 fi
 
 DRIVER="${UPS_DRIVER:-${AUTO_DRIVER}}"
@@ -540,12 +561,11 @@ LOCKFN /var/lib/nut/upssched/upssched.lock
 AT ONBATT * EXECUTE power_lost
 AT ONBATT * START-TIMER shutdown_on_battery ${SHUTDOWN_DELAY}
 
-AT ONLINE * CANCEL-TIMER shutdown_on_battery
+AT ONLINE * CANCEL-TIMER shutdown_on_battery timer_cancel_failed
 AT ONLINE * EXECUTE power_restored
 
-AT LOWBATT * CANCEL-TIMER shutdown_on_battery
+AT LOWBATT * CANCEL-TIMER shutdown_on_battery timer_cancel_failed
 AT LOWBATT * EXECUTE low_battery
-AT LOWBATT * EXECUTE emergency_shutdown
 
 AT FSD * EXECUTE fsd_started
 AT COMMBAD * EXECUTE communication_lost
@@ -606,9 +626,8 @@ case "\${1:-}" in
         event_log "TIMER: ${SHUTDOWN_DELAY}s ciągłej pracy na baterii; rozpoczynam FSD."
         "\${UPSMON}" -c fsd
         ;;
-    emergency_shutdown)
-        event_log "EMERGENCY: LOWBATT; rozpoczynam natychmiastowy FSD."
-        "\${UPSMON}" -c fsd
+    timer_cancel_failed)
+        event_log "CANCEL-FAILED: timer shutdown_on_battery nie został anulowany przed wygaśnięciem."
         ;;
     fsd_started)
         event_log "FSD: rozpoczęto bezpieczne zamykanie hosta."

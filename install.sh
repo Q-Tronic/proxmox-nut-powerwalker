@@ -148,8 +148,11 @@ echo
 # Zmienne środowiskowe takie jak SHUTDOWN_DELAY, FORCE, UPS_DRIVER,
 # UPS_VENDORID, UPS_PRODUCTID, MQTT_HOST itd. są dziedziczone przez
 # główny instalator.
-bash "${PERSISTENT_INSTALLER}"
-RC=$?
+if bash "${PERSISTENT_INSTALLER}"; then
+    RC=0
+else
+    RC=$?
+fi
 
 if [[ "${RC}" -ne 0 ]]; then
     echo
@@ -164,8 +167,11 @@ ok "Główny instalator zakończył pracę poprawnie."
 
 echo
 info "Instaluję/aktualizuję centralny konfigurator nut-config..."
-bash "${PERSISTENT_CONFIG}" --install
-CFG_RC=$?
+if bash "${PERSISTENT_CONFIG}" --install; then
+    CFG_RC=0
+else
+    CFG_RC=$?
+fi
 
 if [[ "${CFG_RC}" -ne 0 ]]; then
     warn "nut-config zakończył się kodem ${CFG_RC}."
