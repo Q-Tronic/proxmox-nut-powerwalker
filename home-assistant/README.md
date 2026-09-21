@@ -1,65 +1,62 @@
 # Home Assistant
 
-Autor: **Q-Tronic**
+Projekt współpracuje z Home Assistant na dwa sposoby:
 
-## Wariant zalecany: oficjalna integracja NUT
+1. przez oficjalną integrację **Network UPS Tools (NUT)** — wariant zalecany;
+2. opcjonalnie przez MQTT i Home Assistant MQTT Discovery.
 
-Po uruchomieniu instalatora na Proxmoxie wpisz:
+Shutdown hosta Proxmox jest wykonywany lokalnie przez NUT. Home Assistant nie jest wymagany do bezpiecznego zamknięcia serwera.
+
+## Integracja NUT
+
+Na Proxmoxie wyświetl aktualne dane połączenia:
 
 ```bash
 nut-ha-info
 ```
 
-Następnie w Home Assistant:
+W Home Assistant przejdź do:
 
 **Ustawienia → Urządzenia i usługi → Dodaj integrację → Network UPS Tools (NUT)**
 
-Wprowadź dane pokazane przez `nut-ha-info`:
+Wprowadź dokładnie host, port, użytkownika i hasło pokazane przez `nut-ha-info`.
 
-- host: IP Proxmoxa,
-- port: `3493`,
-- użytkownik: `homeassistant`,
-- hasło: wygenerowane przez instalator.
+Dla stabilnego połączenia warto używać stałego adresu IP Proxmoxa, rezerwacji DHCP albo stabilnej nazwy DNS.
 
-To jest najważniejsza integracja. **Home Assistant nie steruje shutdownem serwera** — robi to lokalny NUT na Proxmoxie, więc awaria HA nie blokuje bezpiecznego zamknięcia hosta.
+Konto `homeassistant` utworzone przez projekt ma służyć do monitoringu. Nie otrzymuje `instcmds`, więc Home Assistant nie może przez to konto wykonywać poleceń UPS.
 
 ## MQTT
 
-MQTT jest opcjonalną, dodatkową warstwą telemetryczną. Na Proxmoxie:
+MQTT jest opcjonalną dodatkową warstwą telemetryczną.
+
+Konfiguracja:
 
 ```bash
-nut-mqtt-config
+nut-config mqtt setup
 ```
 
-Konfigurator zapyta o:
-
-- adres/IP brokera,
-- port (zwykle `1883`),
-- użytkownika,
-- hasło.
-
-Jeśli brokerem jest dodatek Mosquitto w Home Assistant, z punktu widzenia Proxmoxa użyj **adresu IP Home Assistanta**, nie nazwy `core-mosquitto`.
-
-Po poprawnym teście połączenia zostanie uruchomiona usługa:
+Status:
 
 ```bash
-systemctl status nut-mqtt.service
+nut-config mqtt status
 ```
 
-Most publikuje:
+Wyłączenie:
+
+```bash
+nut-config mqtt disable
+```
+
+Most publikuje stan UPS i konfigurację Home Assistant MQTT Discovery. Nie publikuje topiców sterujących UPS-em.
+
+Jeżeli broker Mosquitto działa jako dodatek Home Assistant, z perspektywy Proxmoxa użyj adresu IP lub nazwy DNS hosta Home Assistant dostępnej w LAN.
+
+## Automatyzacje
+
+Przykłady znajdują się w:
 
 ```text
-qtronic/proxmox/powerwalker/state
-qtronic/proxmox/powerwalker/availability
+home-assistant/automations-example.yaml
 ```
 
-oraz używa **Home Assistant MQTT Discovery**, więc encje powinny pojawić się automatycznie pod jednym urządzeniem „PowerWalker UPS”.
-
-## Ważne
-
-Możesz używać integracji NUT i MQTT równolegle, ale część danych będzie zdublowana. Najrozsądniej traktować:
-
-- **NUT** jako podstawowy monitoring UPS,
-- **MQTT** jako dodatkową telemetrię i źródło do własnych automatyzacji.
-
-MQTT nie ma żadnego topicu sterującego UPS-em i nie może wyłączyć Proxmoxa.
+Po dodaniu integracji sprawdź rzeczywiste `entity_id` w swojej instalacji i dopasuj przykłady przed użyciem.
