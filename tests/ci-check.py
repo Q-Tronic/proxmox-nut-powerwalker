@@ -175,6 +175,10 @@ if 'file-state.txt' not in nut or 'backup-format.txt' not in nut or 'format=2' n
     raise SystemExit("backup v2 manifest missing")
 if 'nut-mqtt działa podczas BYPASS' not in nut:
     raise SystemExit("doctor must check MQTT during BYPASS")
+if 'bypass_services_quiesced' not in nut or 'require_bypass_services_quiesced' not in nut:
+    raise SystemExit("BYPASS must verify monitor and MQTT active/enabled state before ready")
+if '[[ "${BYPASS_READY:-0}" == "1" ]] && bypass_services_quiesced' not in nut:
+    raise SystemExit("BYPASS status/doctor must not trust a stale ready flag")
 if '127.0.0.1:3493 nasłuchuje' not in nut:
     raise SystemExit("doctor localhost listener check missing")
 if 'selftest cleanup' not in nut or 'remove_reserved_selftest_user' not in nut:
@@ -189,6 +193,10 @@ if 'Nie udało się odtworzyć stanu ${unit}' not in nut:
     raise SystemExit("restore service-state failure propagation missing")
 if 'Backup v2 jest niekompletny (brak manifestu).' not in nut or 'Nieoczekiwana ścieżka w manifeście backupu' not in nut:
     raise SystemExit("backup v2 manifest validation missing")
+if 'Wymagany plik backupu nie może być oznaczony jako absent:' not in nut:
+    raise SystemExit("backup v2 must reject absent critical files")
+if 'if ! validate_backup_v2 "${d}"; then' not in nut:
+    raise SystemExit("new backup v2 must be validated before becoming LAST")
 if 'Nieoczekiwana jednostka w manifeście backupu' not in nut or 'Manifest usług backupu v2 jest niekompletny lub zduplikowany.' not in nut:
     raise SystemExit("backup v2 service manifest validation missing")
 if 'Backup ma power-cycle=ON, ale nie zawiera własnego capability fingerprintu.' not in nut:
