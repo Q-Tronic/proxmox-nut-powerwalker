@@ -60,3 +60,11 @@ home-assistant/automations-example.yaml
 ```
 
 Po dodaniu integracji sprawdź rzeczywiste `entity_id` w swojej instalacji i dopasuj przykłady przed użyciem.
+
+
+## Przykładowe automatyzacje
+
+- `automations-nut-example.yaml` — oficjalna integracja NUT;
+- `automations-mqtt-example.yaml` — opcjonalne MQTT Discovery.
+
+`automations-example.yaml` pozostaje zgodnościową kopią wariantu NUT. Zawsze sprawdź rzeczywiste `entity_id`.

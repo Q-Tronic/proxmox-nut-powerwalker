@@ -1,0 +1,27 @@
+# Przykład dla OPCJONALNEGO MQTT Discovery z tego projektu.
+# Encje powstaną tylko po skonfigurowaniu: nut-config mqtt setup
+# Sprawdź rzeczywiste entity_id w swojej instalacji Home Assistant.
+
+- alias: "UPS MQTT - praca na baterii"
+  triggers:
+    - trigger: state
+      entity_id: binary_sensor.powerwalker_praca_na_baterii
+      to: "on"
+  actions:
+    - action: persistent_notification.create
+      data:
+        title: "UPS: praca na baterii"
+        message: "Most MQTT raportuje pracę UPS z baterii."
+  mode: single
+
+- alias: "UPS MQTT - zasilanie wróciło"
+  triggers:
+    - trigger: state
+      entity_id: binary_sensor.powerwalker_zasilanie_sieciowe
+      to: "on"
+  actions:
+    - action: persistent_notification.create
+      data:
+        title: "UPS: zasilanie wróciło"
+        message: "Most MQTT raportuje powrót zasilania sieciowego."
+  mode: single
