@@ -1,0 +1,45 @@
+# Q-Tronic - przykładowe automatyzacje Home Assistant
+#
+# To są przykłady. Po dodaniu integracji sprawdź rzeczywiste entity_id
+# w Narzędzia deweloperskie -> Stany i podmień je poniżej.
+#
+# Nie używamy HA do wyłączania Proxmoxa. Shutdown jest lokalnie w NUT.
+
+- alias: "UPS - zanik zasilania"
+  id: qtronic_ups_power_lost
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.powerwalker_praca_na_baterii
+      from: "off"
+      to: "on"
+  action:
+    - service: persistent_notification.create
+      data:
+        title: "UPS"
+        message: "PowerWalker przeszedł na baterię."
+
+- alias: "UPS - zasilanie wróciło"
+  id: qtronic_ups_power_restored
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.powerwalker_zasilanie_sieciowe
+      from: "off"
+      to: "on"
+  action:
+    - service: persistent_notification.create
+      data:
+        title: "UPS"
+        message: "Zasilanie sieciowe wróciło."
+
+- alias: "UPS - niski poziom baterii"
+  id: qtronic_ups_low_battery
+  trigger:
+    - platform: state
+      entity_id: binary_sensor.powerwalker_niski_poziom_baterii
+      from: "off"
+      to: "on"
+  action:
+    - service: persistent_notification.create
+      data:
+        title: "UPS - LOW BATTERY"
+        message: "UPS zgłosił niski poziom baterii. NUT na Proxmoxie przejmie procedurę shutdownu."
