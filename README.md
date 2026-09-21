@@ -39,22 +39,41 @@ To są funkcje mogące fizycznie odciąć wyjście UPS. Zostaną dopiero osobno 
 
 ## Instalacja na Proxmoxie
 
-Zaloguj się jako `root` przez SSH:
+Najprościej: zaloguj się jako `root` przez SSH i uruchom jedną komendę:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Q-Tronic/proxmox-nut-powerwalker/main/install.sh)
+```
+
+`install.sh` jest małym bootstrapem: pobiera właściwy `setup-nut-powerwalker-proxmox.sh`, sprawdza czy plik wygląda jak skrypt Q-Tronic, wykonuje `bash -n`, zapisuje kopię jako `/root/setup-nut-powerwalker-proxmox.sh` i dopiero wtedy uruchamia główny instalator.
+
+Jeśli na Proxmoxie nie ma `curl`, najpierw:
+
+```bash
+apt update && apt install -y curl ca-certificates
+```
+
+Jeśli chcesz np. 120 sekund zamiast domyślnych 60:
+
+```bash
+SHUTDOWN_DELAY=120 bash <(curl -fsSL https://raw.githubusercontent.com/Q-Tronic/proxmox-nut-powerwalker/main/install.sh)
+```
+
+Możesz także przypiąć instalację do konkretnego tagu, brancha albo commita:
+
+```bash
+QTRONIC_REF=v1.0.0 bash <(curl -fsSL https://raw.githubusercontent.com/Q-Tronic/proxmox-nut-powerwalker/main/install.sh)
+```
+
+### Alternatywnie: instalacja przez `git clone`
 
 ```bash
 apt update
 apt install -y git
 cd /root
-git clone TWOJ_ADRES_REPOZYTORIUM_GITHUB.git proxmox-nut-powerwalker
+git clone https://github.com/Q-Tronic/proxmox-nut-powerwalker.git
 cd proxmox-nut-powerwalker
-chmod +x setup-nut-powerwalker-proxmox.sh
 bash ./setup-nut-powerwalker-proxmox.sh
-```
-
-Jeśli chcesz np. 120 sekund zamiast 60:
-
-```bash
-SHUTDOWN_DELAY=120 bash ./setup-nut-powerwalker-proxmox.sh
 ```
 
 ## Najważniejsze komendy po instalacji
@@ -220,6 +239,7 @@ Najprościej zrobić to w przeglądarce telefonu na `github.com`.
 4. Wejdź do pustego repozytorium.
 5. Wybierz **Add file → Upload files**.
 6. Wgraj:
+   - `install.sh`
    - `setup-nut-powerwalker-proxmox.sh`
    - `README.md`
    - `.gitignore`
@@ -233,29 +253,23 @@ Jeśli mobilny interfejs GitHuba nie pokazuje wygodnie `Upload files`, włącz w
 
 ## Użycie repo na Proxmoxie
 
-Dla repo publicznego:
+Dla tego publicznego repo najprościej:
 
 ```bash
-apt update
-apt install -y git
-cd /root
-git clone https://github.com/TWOJ_LOGIN/proxmox-nut-powerwalker.git
-cd proxmox-nut-powerwalker
-chmod +x setup-nut-powerwalker-proxmox.sh
-bash ./setup-nut-powerwalker-proxmox.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/Q-Tronic/proxmox-nut-powerwalker/main/install.sh)
 ```
 
-Dla repo prywatnego najwygodniej użyć klucza SSH GitHuba albo tokenu. Nie zapisuj tokenu bezpośrednio w skrypcie.
+Nie trzeba robić `git clone`, `cd` ani `chmod`.
 
 ## Aktualizacja później
 
+Aby pobrać aktualną wersję instalatora z brancha `main`, po prostu uruchom tę samą komendę ponownie:
+
 ```bash
-cd /root/proxmox-nut-powerwalker
-git pull
-bash ./setup-nut-powerwalker-proxmox.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/Q-Tronic/proxmox-nut-powerwalker/main/install.sh)
 ```
 
-Instalator zachowa istniejące hasła i utworzy nowy backup przed zmianami.
+Główny instalator zachowa istniejące wygenerowane hasła i przed zmianami wykona kolejny backup konfiguracji NUT.
 
 
 ## GitHub z telefonu
