@@ -1857,6 +1857,80 @@ bypass_resume() {
     fi
 }
 
+
+update_project() {
+    require_normal_mode
+    load_settings
+    load_creds
+
+    command -v curl >/dev/null 2>&1 || die "Brak curl. Zainstaluj pakiet curl i spróbuj ponownie."
+
+    local status backup tmp url rc
+    status="$(status_now || true)"
+    [[ -n "${status}" ]] || die "Nie aktualizuję bez komunikacji z UPS. Najpierw przywróć UPS i sprawdź: nut-status"
+    printf '%s\n' "${status}" | grep -qw OL || die "Aktualizacja wymaga stabilnego OL. Aktualny status: ${status}"
+    ! printf '%s\n' "${status}" | grep -qw OB || die "UPS raportuje OB. Nie aktualizuję podczas pracy na baterii."
+
+    backup="$(backup_now)"
+    tmp="$(mktemp /tmp/qtronic-update-install.XXXXXX.sh)"
+    chmod 0700 "${tmp}"
+    url="https://raw.githubusercontent.com/Q-Tronic/proxmox-nut-powerwalker/main/install.sh"
+
+    info "Backup przed aktualizacją: ${backup}"
+    info "Pobieram aktualny bootstrap z oficjalnego repo Q-Tronic..."
+    if ! curl \
+        --fail \
+        --silent \
+        --show-error \
+        --location \
+        --retry 3 \
+        --retry-delay 2 \
+        --connect-timeout 10 \
+        --max-time 120 \
+        --proto '=https' \
+        --tlsv1.2 \
+        "${url}" -o "${tmp}"; then
+        rm -f "${tmp}"
+        die "Nie udało się pobrać instalatora aktualizacji. Obecna instalacja nie została przez ten krok zmieniona."
+    fi
+
+    [[ -s "${tmp}" ]] || { rm -f "${tmp}"; die "Pobrany install.sh jest pusty."; }
+    head -n1 "${tmp}" | grep -Fq '#!/usr/bin/env bash' \
+        || { rm -f "${tmp}"; die "Pobrany plik nie wygląda jak skrypt Bash."; }
+    grep -Fq 'REPO_OWNER="Q-Tronic"' "${tmp}" \
+        || { rm -f "${tmp}"; die "Pobrany install.sh nie zawiera oczekiwanego repozytorium Q-Tronic."; }
+    grep -Fq 'REPO_NAME="proxmox-nut-powerwalker"' "${tmp}" \
+        || { rm -f "${tmp}"; die "Pobrany install.sh nie zawiera oczekiwanej nazwy projektu."; }
+    bash -n "${tmp}" \
+        || { rm -f "${tmp}"; die "Pobrany install.sh nie przeszedł bash -n."; }
+
+    echo
+    echo "Aktualizacja uruchomi oficjalny install.sh z gałęzi main."
+    echo "Istniejące dane dostępowe i ustawienia Q-Tronic mają zostać zachowane,"
+    echo "a konfiguracja po aktualizacji zostanie ponownie zweryfikowana przez instalator."
+    echo
+
+    set +e
+    bash "${tmp}"
+    rc=$?
+    set -e
+    rm -f "${tmp}"
+
+    if (( rc != 0 )); then
+        warn "Aktualizacja zakończyła się kodem ${rc}."
+        echo "Backup sprzed aktualizacji nut-config: ${backup}"
+        echo "Diagnostyka: nut-report"
+        echo "Pełny rollback instalatora (jeśli potrzebny): nut-rollback"
+        return "${rc}"
+    fi
+
+    ok "Aktualizacja zakończona."
+    echo "Po wyjściu z bieżącego polecenia sprawdź:"
+    echo "  nut-status"
+    echo "  nut-config show"
+    echo "  nut-config powercycle status"
+}
+
 help_text() {
     cat <<'EOF_HELP'
 Q-Tronic nut-config — pomoc
@@ -1884,6 +1958,22 @@ SZYBKI START
       Ponownie renderuje i stosuje zapisane ustawienia. Tworzy backup, wymaga bezpiecznego
       stanu i po zmianie sprawdza stabilne OL. Przy błędzie wykonuje rollback.
       Blokowane w BYPASS, bo planowo odłączony UPS nie powinien być restartowany/sondowany.
+
+AKTUALIZACJA
+  nut-config update
+      Zalecany sposób aktualizacji projektu z gałęzi main. Komenda:
+      - odmawia pracy podczas BYPASS;
+      - wymaga komunikacji z UPS i stabilnego OL;
+      - tworzy dodatkowy backup konfiguracji przed aktualizacją;
+      - pobiera oficjalny install.sh tylko przez HTTPS;
+      - sprawdza podstawowe markery projektu oraz bash -n;
+      - uruchamia ten sam bezpieczny bootstrap co pierwsza instalacja;
+      - zachowuje istniejące dane dostępowe i ustawienia Q-Tronic;
+      - po aktualizacji główny instalator ponownie waliduje UPS i stos NUT.
+      Jeśli aktualizacja zwróci błąd, nie ignoruj go: uruchom nut-report i sprawdź backup.
+
+      Alternatywa ręczna (robi to samo z publicznego main):
+        bash <(curl -fsSL https://raw.githubusercontent.com/Q-Tronic/proxmox-nut-powerwalker/main/install.sh)
 
 SHUTDOWN
   nut-delay
@@ -2252,7 +2342,8 @@ menu() {
         echo "8)  [OPCJONALNE] MQTT"
         echo "9)  [ODCZYT] Diagnostyka / logi / test guide"
         echo "10) [ODZYSKIWANIE] Backup / rollback"
-        echo "11) [POMOC] Opis wszystkich komend"
+        echo "11) [AKTUALIZACJA] Pobierz i zainstaluj najnowszą wersję"
+        echo "12) [POMOC] Opis wszystkich komend"
         echo "0)  Wyjście"
         read -r -p "Wybór: " choice
 
@@ -2370,7 +2461,26 @@ menu() {
                 esac
                 menu_pause
                 ;;
-            11) help_text; menu_pause ;;
+            11)
+                echo
+                echo "Aktualizacja wymaga podłączonego UPS w stabilnym OL."
+                echo "Nie działa w BYPASS. Przed pobraniem zostanie utworzony backup."
+                echo "Źródło: oficjalna gałąź main repo Q-Tronic/proxmox-nut-powerwalker."
+                if menu_confirm_word AKTUALIZUJ "Skrypt pobierze i uruchomi kod instalatora jako root."; then
+                    if update_project; then
+                        echo
+                        echo "Aktualizacja zakończona. Zamykam stare menu."
+                        echo "Uruchom ponownie: nut-config menu"
+                        exit 0
+                    else
+                        warn "Aktualizacja nie została zakończona poprawnie. Sprawdź komunikaty powyżej."
+                    fi
+                else
+                    echo "Anulowano."
+                fi
+                menu_pause
+                ;;
+            12) help_text; menu_pause ;;
             0) exit 0 ;;
             *) echo "Nieprawidłowy wybór."; menu_pause ;;
         esac
@@ -2545,6 +2655,10 @@ case "${cmd}" in
         ;;
     monitor)
         monitor_cmd "${1:-status}"
+        ;;
+    update)
+        [[ $# -eq 0 ]] || die "Użycie: nut-config update"
+        update_project
         ;;
     backup)
         echo "$(backup_now)"

@@ -1736,6 +1736,9 @@ Planowane fizyczne odłączenie UPS:
 Powrót po ponownym podłączeniu UPS:
   nut-config resume
 
+Aktualizacja projektu (wymaga stabilnego OL, blokowana w BYPASS):
+  nut-config update
+
 Pełny raport diagnostyczny:
   nut-report
 
@@ -1828,6 +1831,7 @@ echo "  nut-test-guide"
 echo "  nut-report"
 echo "  nut-ha-info"
 echo "  nut-mqtt-config"
+echo "  nut-config update"
 echo
 echo "Raport diagnostyczny:"
 echo "  nut-report"

@@ -1095,17 +1095,78 @@ nut-phase2-check
 
 # Aktualizacja
 
-Przy podłączonym, stabilnym UPS (`OL`) uruchom ponownie:
+## Zalecana metoda
+
+Przy podłączonym UPS-ie i stabilnym `OL` uruchom:
+
+```bash
+nut-config update
+```
+
+To jest najprostsza i zalecana metoda dla zwykłego użytkownika. Komenda nie aktualizuje systemu „w ciemno”. Najpierw:
+
+1. sprawdza, czy BYPASS nie jest aktywny;
+2. wymaga działającej komunikacji z UPS-em;
+3. wymaga stabilnego `OL` i odmawia aktualizacji podczas `OB`;
+4. tworzy dodatkowy backup bieżącej konfiguracji;
+5. pobiera oficjalny `install.sh` z `Q-Tronic/proxmox-nut-powerwalker` przez HTTPS;
+6. sprawdza podstawowe markery projektu oraz składnię `bash -n`;
+7. dopiero wtedy uruchamia właściwy bootstrap aktualizacyjny;
+8. instalator zachowuje istniejące dane dostępowe i centralne ustawienia Q-Tronic, a po aktualizacji ponownie waliduje stos NUT.
+
+Po udanej aktualizacji sprawdź:
+
+```bash
+nut-status
+nut-config show
+nut-config powercycle status
+```
+
+Jeśli aktualizacja zgłosi błąd, nie uruchamiaj kolejnych ryzykownych operacji. Najpierw:
+
+```bash
+nut-report
+```
+
+i sprawdź utworzony backup.
+
+### Aktualizacja z menu
+
+Uruchom:
+
+```bash
+nut-config menu
+```
+
+i wybierz:
+
+```text
+[AKTUALIZACJA] Pobierz i zainstaluj najnowszą wersję
+```
+
+Menu wyświetla ostrzeżenie i wymaga wpisania słowa:
+
+```text
+AKTUALIZUJ
+```
+
+przed uruchomieniem kodu pobranego z repo jako `root`.
+
+### Metoda ręczna
+
+Można nadal użyć bezpośrednio publicznego bootstrapu:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/Q-Tronic/proxmox-nut-powerwalker/main/install.sh)
 ```
 
-**Aktualizacja jest celowo blokowana podczas aktywnego BYPASS.** Najpierw podłącz UPS i wykonaj:
+Ta metoda jest również zabezpieczona po stronie głównego setupu. **Aktualizacja/reinstalacja jest celowo blokowana podczas aktywnego BYPASS.** Najpierw trzeba ponownie podłączyć UPS i zakończyć BYPASS:
 
 ```bash
 nut-config resume
 ```
+
+Nie aktualizuj podczas zaniku zasilania ani przy `ups.status: OB`.
 
 ---
 
