@@ -35,7 +35,7 @@ Uruchom jako `root` na hoście Proxmox:
 bash <(curl -fsSL https://raw.githubusercontent.com/Q-Tronic/proxmox-nut-powerwalker/main/install.sh)
 ```
 
-Instalator robi backup istniejącej konfiguracji, wykrywa UPS, instaluje NUT, sprawdza komunikację i dopiero po stabilnym `OL` może uruchomić `nut-monitor`.
+Instalator robi backup istniejącej konfiguracji, wykrywa UPS, instaluje NUT, sprawdza komunikację i dopiero po stabilnym `OL` może uruchomić `nut-monitor`. Backup instalatora dostaje unikalny katalog nawet przy dwóch uruchomieniach w tej samej sekundzie. Jeżeli wykryta konfiguracja jest już zarządzana przez Q-Tronic, reinstalacja/aktualizacja ma dodatkowy preflight: **zanim zmieni `/etc/nut`, aktualny UPS musi odpowiadać i raportować stabilne `OL` bez `OB`**.
 
 Po instalacji zacznij od:
 
@@ -371,11 +371,13 @@ Zatrzymuje i wyłącza `nut-mqtt.service`, ale zachowuje `/etc/nut/nut-mqtt.json
 nut-rollback
 ```
 
-Przywraca ostatni backup utworzony przez **główny instalator**. To nie jest to samo co `nut-config rollback`.
+Przywraca ostatni **snapshot konfiguracji** utworzony przez główny instalator. To nie jest to samo co `nut-config rollback`.
 
-Podczas BYPASS pełny rollback instalatora jest blokowany.
+Snapshot zapisuje również stan `active/enabled` usług NUT, MQTT i health-watchdoga. Przy odtwarzaniu aktywnego `nut-monitor` skrypt ponownie wymaga komunikacji z UPS i stabilnego `OL`; nieudany start lub walidacja kończy rollback błędem zamiast udawać sukces. Jeżeli przed pierwszą instalacją nie istniał `/etc/nut`, rollback usuwa utworzoną konfigurację i pozostawia ochronę rozbrojoną.
 
-**Używaj do odzyskiwania konfiguracji po problemie z instalacją/aktualizacją, nie jako zwykłej opcji cofania jednej zmiany.**
+**`nut-rollback` nie cofa wersji kodu, nie usuwa zainstalowanych pakietów i nie jest deinstalatorem.** Służy do odzyskania snapshotu konfiguracji po problemie z instalacją/aktualizacją.
+
+Podczas BYPASS rollback snapshotu instalatora jest blokowany.
 
 ---
 

@@ -65,7 +65,7 @@ REPORT_DIR="${BASE_DIR}/reports"
 LOG_DIR="/var/log/nut-powerwalker"
 LIB_DIR="/usr/local/lib/nut-powerwalker"
 TS="$(date +%Y%m%d-%H%M%S)"
-BACKUP_DIR="${BACKUP_ROOT}/nut-${TS}"
+BACKUP_DIR=""
 MARKER="# managed-by: q-tronic-nut-powerwalker-installer"
 
 C_GREEN='\033[1;32m'
@@ -105,6 +105,42 @@ esac
 
 mkdir -p "${BASE_DIR}" "${BACKUP_ROOT}" "${REPORT_DIR}" "${LIB_DIR}"
 chmod 0700 "${BASE_DIR}" "${BACKUP_ROOT}" "${REPORT_DIR}"
+
+# Jeśli aktualizujemy/reinstalujemy konfigurację już zarządzaną przez ten projekt,
+# najpierw wymagamy działającej komunikacji i stabilnego OL. To jest preflight
+# PRZED backupem i PRZED jakąkolwiek zmianą /etc/nut.
+if [[ -f /etc/nut/ups.conf ]] && grep -Fq "${MARKER}" /etc/nut/ups.conf 2>/dev/null; then
+    EXISTING_UPSC_BIN="$(command -v upsc || true)"
+    command -v timeout >/dev/null 2>&1 || die "Brak timeout; nie wykonuję bezpiecznej reinstalacji zarządzanej konfiguracji."
+    [[ -n "${EXISTING_UPSC_BIN}" ]] || die "Istnieje konfiguracja Q-Tronic, ale brak upsc. Nie aktualizuję jej w ciemno."
+
+    EXISTING_UPS_NAME="$(awk '
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+            gsub(/^[[:space:]]*\[/, "");
+            gsub(/\][[:space:]]*$/, "");
+            print; exit
+        }' /etc/nut/ups.conf 2>/dev/null || true)"
+    [[ -n "${EXISTING_UPS_NAME}" ]] || die "Istnieje konfiguracja Q-Tronic, ale nie umiem odczytać nazwy UPS z /etc/nut/ups.conf."
+
+    EXISTING_LOCAL_PORT="$(awk '$1=="LISTEN" && ($2=="127.0.0.1" || $2=="localhost") {print $3; exit}' /etc/nut/upsd.conf 2>/dev/null || true)"
+    EXISTING_TARGET="${EXISTING_UPS_NAME}@localhost"
+    if [[ -n "${EXISTING_LOCAL_PORT}" && "${EXISTING_LOCAL_PORT}" != "3493" ]]; then
+        EXISTING_TARGET="${EXISTING_TARGET}:${EXISTING_LOCAL_PORT}"
+    fi
+
+    if ! EXISTING_RAW="$(timeout 8s "${EXISTING_UPSC_BIN}" "${EXISTING_TARGET}" 2>&1)"; then
+        die "Istnieje zarządzana konfiguracja Q-Tronic, ale UPS nie odpowiada. Nie aktualizuję/reinstaluję NUT podczas nieznanego stanu. Najpierw przywróć komunikację i stabilne OL."
+    fi
+    EXISTING_STATUS="$(printf '%s\n' "${EXISTING_RAW}" | sed -n 's/^ups.status: //p' | head -n1)"
+    [[ -n "${EXISTING_STATUS}" ]] || die "UPS odpowiada, ale brak ups.status. Nie aktualizuję zarządzanej konfiguracji."
+    printf '%s\n' "${EXISTING_STATUS}" | grep -qw OL || die "Aktualizacja/reinstalacja istniejącej konfiguracji Q-Tronic wymaga stabilnego OL. Status: ${EXISTING_STATUS}"
+    ! printf '%s\n' "${EXISTING_STATUS}" | grep -qw OB || die "UPS raportuje OB. Nie aktualizuję/reinstaluję podczas pracy z baterii."
+    ok "Preflight aktualizacji/reinstalacji: UPS ${EXISTING_UPS_NAME} odpowiada i jest stabilnie OL."
+fi
+
+# mktemp eliminuje kolizję dwóch instalacji uruchomionych w tej samej sekundzie.
+BACKUP_DIR="$(mktemp -d "${BACKUP_ROOT}/nut-${TS}-XXXXXX")"
+chmod 0700 "${BACKUP_DIR}"
 chmod 0755 "${LIB_DIR}"
 
 atomic_install() {
@@ -143,6 +179,8 @@ fi
     service_state nut-monitor.service
     service_state nut-driver-enumerator.service
     service_state nut-driver-enumerator.path
+    service_state nut-mqtt.service
+    service_state qtronic-nut-health.timer
 } > "${BACKUP_DIR}/service-state.txt"
 
 printf '%s\n' "${BACKUP_DIR}" > "${BASE_DIR}/LAST_BACKUP"
@@ -1569,45 +1607,196 @@ systemctl disable --now nut-mqtt.service 2>/dev/null || true
 echo "Most NUT -> MQTT wyłączony. Konfiguracja /etc/nut/nut-mqtt.json została zachowana."
 EOF
 
-# Rollback
-atomic_install "${LIB_DIR}/rollback-last-backup.sh" root root 0755 <<EOF
+# Rollback snapshotu głównego instalatora.
+# To NIE jest deinstalator ani mechanizm cofania kodu/pakietów projektu.
+atomic_install "${LIB_DIR}/rollback-last-backup.sh" root root 0755 <<'EOF_ROLLBACK'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
 if [[ -f /etc/nut/qtronic-bypass-state.env ]]; then
-    echo "BYPASS jest aktywny. Nie wykonuję pełnego rollbacku instalatora w tym trybie." >&2
+    echo "BYPASS jest aktywny. Nie przywracam snapshotu instalatora w tym trybie." >&2
     echo "Najpierw podłącz UPS i uruchom: nut-config resume" >&2
     exit 20
 fi
 
-BASE="${BASE_DIR}"
-BACKUP="\$(cat "\${BASE}/LAST_BACKUP")"
+BASE="/root/nut-powerwalker"
+LAST="${BASE}/LAST_BACKUP"
+[[ -r "${LAST}" ]] || { echo "Brak ${LAST}." >&2; exit 1; }
+BACKUP="$(cat "${LAST}")"
+STATE_FILE="${BACKUP}/service-state.txt"
 
-[[ -d "\${BACKUP}" ]] || { echo "Brak backupu: \${BACKUP}"; exit 1; }
+[[ -d "${BACKUP}" ]] || { echo "Brak backupu: ${BACKUP}" >&2; exit 1; }
+[[ -r "${STATE_FILE}" ]] || { echo "Backup nie ma service-state.txt: ${BACKUP}" >&2; exit 1; }
 
-systemctl disable --now nut-mqtt.service 2>/dev/null || true
-systemctl stop nut-monitor.service 2>/dev/null || true
-systemctl stop nut-server.service 2>/dev/null || true
+state_field() {
+    local unit="$1" key="$2"
+    awk -v u="${unit}" -v k="${key}" '
+        $1 == u {
+            for (i=2; i<=NF; i++) {
+                split($i, a, "=")
+                if (a[1] == k) { print a[2]; exit }
+            }
+        }' "${STATE_FILE}"
+}
 
-if [[ -d "\${BACKUP}/nut" ]]; then
+restore_enable_state() {
+    local unit="$1" desired="$2"
+    case "${desired}" in
+        enabled)
+            systemctl unmask "${unit}" >/dev/null 2>&1 || true
+            systemctl enable "${unit}" >/dev/null
+            ;;
+        enabled-runtime)
+            systemctl unmask "${unit}" >/dev/null 2>&1 || true
+            systemctl enable --runtime "${unit}" >/dev/null
+            ;;
+        disabled)
+            systemctl unmask "${unit}" >/dev/null 2>&1 || true
+            systemctl disable "${unit}" >/dev/null 2>&1
+            ;;
+        masked|masked-runtime)
+            systemctl mask "${unit}" >/dev/null
+            ;;
+        static|indirect|generated|transient|alias|linked|linked-runtime)
+            # Tych stanów nie "produkujemy" enable/disable; wynikają z definicji jednostki.
+            ;;
+        not-found|'')
+            # Przed snapshotem jednostki mogło jeszcze nie być. Kod/pakiety pozostają
+            # zainstalowane, ale nie pozostawiamy nowo dodanej jednostki uzbrojonej.
+            systemctl disable "${unit}" >/dev/null 2>&1 || true
+            ;;
+        *)
+            echo "Nieznany zapisany stan enabled dla ${unit}: ${desired}" >&2
+            return 1
+            ;;
+    esac
+}
+
+restore_active_state() {
+    local unit="$1" desired="$2"
+    case "${desired}" in
+        active|activating|reloading)
+            systemctl start "${unit}"
+            ;;
+        inactive|failed|deactivating|not-found|'')
+            systemctl stop "${unit}" >/dev/null 2>&1 || true
+            ;;
+        *)
+            echo "Nieznany zapisany stan active dla ${unit}: ${desired}" >&2
+            return 1
+            ;;
+    esac
+}
+
+restore_unit_state() {
+    local unit="$1" en act
+    en="$(state_field "${unit}" enabled)"
+    act="$(state_field "${unit}" active)"
+    restore_enable_state "${unit}" "${en}" || {
+        echo "Nie udało się odtworzyć stanu enabled ${unit}." >&2
+        return 1
+    }
+    restore_active_state "${unit}" "${act}" || {
+        echo "Nie udało się odtworzyć stanu active ${unit}." >&2
+        return 1
+    }
+}
+
+restored_target() {
+    local ups port target
+    ups="$(awk '
+        /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
+            gsub(/^[[:space:]]*\[/, "");
+            gsub(/\][[:space:]]*$/, "");
+            print; exit
+        }' /etc/nut/ups.conf 2>/dev/null || true)"
+    [[ -n "${ups}" ]] || return 1
+    port="$(awk '$1=="LISTEN" && ($2=="127.0.0.1" || $2=="localhost") {print $3; exit}' /etc/nut/upsd.conf 2>/dev/null || true)"
+    target="${ups}@localhost"
+    [[ -n "${port}" && "${port}" != "3493" ]] && target="${target}:${port}"
+    printf '%s\n' "${target}"
+}
+
+require_restored_ol() {
+    local target raw status
+    command -v upsc >/dev/null 2>&1 || { echo "Brak upsc; nie uzbrajam monitora po rollbacku." >&2; return 1; }
+    command -v timeout >/dev/null 2>&1 || { echo "Brak timeout; nie uzbrajam monitora po rollbacku." >&2; return 1; }
+    target="$(restored_target)" || { echo "Nie umiem ustalić UPS z przywróconego /etc/nut/ups.conf." >&2; return 1; }
+    raw="$(timeout 10s upsc "${target}" 2>&1)" || { echo "UPS nie odpowiada po restore: ${target}" >&2; return 1; }
+    status="$(printf '%s\n' "${raw}" | sed -n 's/^ups.status: //p' | head -n1)"
+    [[ -n "${status}" ]] || { echo "Po restore brak ups.status." >&2; return 1; }
+    printf '%s\n' "${status}" | grep -qw OL || { echo "Po restore UPS nie jest OL: ${status}" >&2; return 1; }
+    ! printf '%s\n' "${status}" | grep -qw OB || { echo "Po restore UPS raportuje OB: ${status}" >&2; return 1; }
+}
+
+# Najpierw rozbrajamy aktualny runtime. Tu błędy stop nie są krytyczne; krytyczne
+# są późniejsze starty i walidacja odtwarzanego stanu.
+systemctl disable --now qtronic-nut-health.timer >/dev/null 2>&1 || true
+systemctl disable --now nut-mqtt.service >/dev/null 2>&1 || true
+systemctl stop nut-monitor.service >/dev/null 2>&1 || true
+systemctl stop nut-server.service >/dev/null 2>&1 || true
+systemctl stop nut-driver-enumerator.path >/dev/null 2>&1 || true
+systemctl stop nut-driver-enumerator.service >/dev/null 2>&1 || true
+
+if [[ -d "${BACKUP}/nut" ]]; then
     rm -rf /etc/nut
-    cp -a "\${BACKUP}/nut" /etc/nut
+    cp -a "${BACKUP}/nut" /etc/nut
+elif [[ -e "${BACKUP}/NO_ETC_NUT_BEFORE_INSTALL" ]]; then
+    rm -rf /etc/nut
 else
-    echo "Przed instalacją nie było /etc/nut."
+    echo "Backup nie zawiera ani katalogu nut, ani NO_ETC_NUT_BEFORE_INSTALL." >&2
+    exit 2
 fi
 
 systemctl daemon-reload
 
-if grep -q 'nut-server.service.*active=active' "\${BACKUP}/service-state.txt" 2>/dev/null; then
-    systemctl restart nut-server.service 2>/dev/null || true
+# Odtwarzamy warstwę driver/server w stanie zapisanym w snapshotcie.
+restore_unit_state nut-driver-enumerator.path || exit 3
+restore_unit_state nut-driver-enumerator.service || exit 3
+restore_unit_state nut-server.service || exit 3
+
+if [[ -e "${BACKUP}/NO_ETC_NUT_BEFORE_INSTALL" ]]; then
+    # Przed instalacją nie było /etc/nut. Nie próbujemy uruchamiać monitora/MQTT
+    # na nieistniejącej konfiguracji; odtwarzamy ich enable-state fail-closed.
+    restore_enable_state nut-monitor.service "$(state_field nut-monitor.service enabled)" || exit 4
+    systemctl stop nut-monitor.service >/dev/null 2>&1 || true
+    restore_enable_state nut-mqtt.service "$(state_field nut-mqtt.service enabled)" || exit 4
+    systemctl stop nut-mqtt.service >/dev/null 2>&1 || true
+    restore_enable_state qtronic-nut-health.timer "$(state_field qtronic-nut-health.timer enabled)" || exit 4
+    systemctl stop qtronic-nut-health.timer >/dev/null 2>&1 || true
+else
+    # Monitor może wrócić do ACTIVE tylko po świeżym potwierdzeniu OL.
+    monitor_en="$(state_field nut-monitor.service enabled)"
+    monitor_act="$(state_field nut-monitor.service active)"
+    restore_enable_state nut-monitor.service "${monitor_en}" || exit 5
+    if [[ "${monitor_act}" == "active" || "${monitor_act}" == "activating" || "${monitor_act}" == "reloading" ]]; then
+        require_restored_ol || {
+            systemctl stop nut-monitor.service >/dev/null 2>&1 || true
+            echo "Monitor pozostaje rozbrojony: przywrócony snapshot nie przeszedł walidacji OL." >&2
+            exit 6
+        }
+        systemctl start nut-monitor.service || exit 6
+    else
+        systemctl stop nut-monitor.service >/dev/null 2>&1 || true
+    fi
+
+    mqtt_en="$(state_field nut-mqtt.service enabled)"
+    mqtt_act="$(state_field nut-mqtt.service active)"
+    restore_enable_state nut-mqtt.service "${mqtt_en}" || exit 7
+    if [[ "${mqtt_act}" == "active" || "${mqtt_act}" == "activating" || "${mqtt_act}" == "reloading" ]]; then
+        [[ -r /etc/nut/nut-mqtt.json ]] || { echo "Snapshot oczekuje aktywnego MQTT, ale brak /etc/nut/nut-mqtt.json." >&2; exit 7; }
+        systemctl start nut-mqtt.service || exit 7
+    else
+        systemctl stop nut-mqtt.service >/dev/null 2>&1 || true
+    fi
+
+    restore_unit_state qtronic-nut-health.timer || exit 8
 fi
 
-if grep -q 'nut-monitor.service.*active=active' "\${BACKUP}/service-state.txt" 2>/dev/null; then
-    systemctl restart nut-monitor.service 2>/dev/null || true
-fi
-
-echo "Przywrócono backup: \${BACKUP}"
-EOF
+echo "Przywrócono snapshot konfiguracji głównego instalatora: ${BACKUP}"
+echo "UWAGA: nut-rollback NIE cofa wersji kodu i NIE odinstalowuje pakietów."
+echo "Po rollbacku sprawdź: nut-status ; nut-config doctor"
+EOF_ROLLBACK
 
 # Symlinki komend
 ln -sf "${LIB_DIR}/nut-status.sh" /usr/local/sbin/nut-status

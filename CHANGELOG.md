@@ -19,6 +19,11 @@ Finalny kandydat przed testami na fizycznym PowerWalkerze.
 - `doctor` i watchdog sprawdzają lokalny nasłuch 127.0.0.1:3493, MQTT w BYPASS, zgodność `SHUTDOWNCMD` z power-cycle, bieżący fingerprint UPS, stale runtime i osierocone konto self-test.
 - Dodano `nut-config selftest cleanup`; instalacja/aktualizacja usuwa zarezerwowane osierocone konto self-test.
 - `install.sh` poprawnie przechwytuje kody błędów setupu i konfiguratora mimo `set -e`.
+- Ostatni hotfix instalatora: katalog backupu głównego setupu jest unikalny (`mktemp`), więc równoległe/sekundowe uruchomienia nie nadpiszą tego samego snapshotu.
+- Reinstalacja/aktualizacja już zarządzanej konfiguracji Q-Tronic ma preflight przed zmianą `/etc/nut`: wymagane są komunikacja i stabilne `OL` bez `OB`.
+- Snapshot instalatora zapisuje również `active/enabled` dla MQTT i health-watchdoga, nie tylko podstawowych usług NUT.
+- `nut-rollback` odtwarza snapshot fail-closed: zachowuje stany usług, wymaga świeżego `OL` przed ponownym startem monitora i propaguje błędy zamiast je maskować.
+- Gdy przed instalacją nie istniał `/etc/nut`, rollback poprawnie odtwarza ten brak; jednocześnie jasno pozostaje rollbackiem konfiguracji, a nie deinstalatorem ani mechanizmem cofania kodu/pakietów.
 
 ### Home Assistant
 
