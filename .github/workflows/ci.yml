@@ -1,1 +1,25 @@
+name: CI
 
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install validators
+        run: sudo apt-get update && sudo apt-get install -y shellcheck python3-yaml
+      - name: Bash syntax
+        run: |
+          bash -n install.sh
+          bash -n setup-nut-powerwalker-proxmox.sh
+          bash -n nut-config.sh
+      - name: ShellCheck errors
+        run: shellcheck -S error install.sh setup-nut-powerwalker-proxmox.sh nut-config.sh
+      - name: Static project checks
+        run: python3 tests/ci-check.py

@@ -1,0 +1,31 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install validators
+        run: sudo apt-get update && sudo apt-get install -y shellcheck python3-yaml
+      - name: Validate tag and project
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          test "${TAG#v}" = "$(tr -d '\r\n' < VERSION)" || { echo "Tag ${TAG} != VERSION $(cat VERSION)"; exit 1; }
+          bash -n install.sh
+          bash -n setup-nut-powerwalker-proxmox.sh
+          bash -n nut-config.sh
+          shellcheck -S error install.sh setup-nut-powerwalker-proxmox.sh nut-config.sh
+          python3 tests/ci-check.py
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" --generate-notes --title "${GITHUB_REF_NAME}"
