@@ -560,7 +560,9 @@ install_rendered() {
 }
 
 apply_current() {
-    load_settings
+    # UWAGA: nie wywołuj tutaj load_settings.
+    # Wywołujący ma już w pamięci aktualne wartości (również świeżo zmienione).
+    # Ponowne load_settings w tym miejscu kasowałoby zmianę przed zapisem.
     load_creds
     validate_settings
     require_safe_change_window
@@ -601,6 +603,18 @@ apply_current() {
         warn "Przywracam backup: ${backup}"
         restore_backup_dir "${backup}"
         return 11
+    fi
+
+    # Gdy power-cycle jest aktywny, sprawdzamy capabilities jeszcze raz
+    # po restarcie sterownika. Zmiana drivera/USB nie może pozostawić
+    # aktywnego power-cycle dla niezweryfikowanego urządzenia.
+    if [[ "${POWERCYCLE_ENABLED}" == "1" ]]; then
+        if ! powercycle_probe 1; then
+            warn "Po restarcie aktualny UPS nie przechodzi capability gate."
+            warn "Przywracam backup: ${backup}"
+            restore_backup_dir "${backup}"
+            return 12
+        fi
     fi
 
     if [[ "${previous_monitor}" == "active" ]]; then
@@ -1141,7 +1155,7 @@ CUSTOM_HOOK_NAME="qtronic-nut-powercycle"
 powercycle_fingerprint() {
     local raw="$1"
     printf '%s\n' "${raw}" |
-        grep -E '^(device\.mfr|device\.model|device\.serial|ups\.mfr|ups\.model|ups\.serial|ups\.vendorid|ups\.productid|driver\.name|driver\.version\.data):' |
+        grep -E '^(device\.mfr|device\.model|device\.serial|ups\.mfr|ups\.model|ups\.serial|ups\.vendorid|ups\.productid|driver\.parameter\.vendorid|driver\.parameter\.productid|driver\.name|driver\.version\.data):' |
         sort |
         sha256sum |
         awk '{print $1}'
@@ -1149,8 +1163,9 @@ powercycle_fingerprint() {
 
 powercycle_probe() {
     local quiet="${1:-0}"
-    load_settings
 
+    # Nie przeładowujemy tutaj settings. Probe ma sprawdzać sprzęt dla
+    # aktualnej transakcji konfiguracyjnej, bez kasowania zmian w pamięci.
     local raw cmds rw status fp driver_name vendorid productid
     local has_return=0 has_start=0 has_shutdown=0 has_off_delay=0 has_on_delay=0
     local supported=0
@@ -1180,6 +1195,10 @@ powercycle_probe() {
     driver_name="$(printf '%s\n' "${raw}" | sed -n 's/^driver.name: //p' | head -n1)"
     vendorid="$(printf '%s\n' "${raw}" | sed -n 's/^ups.vendorid: //p' | head -n1)"
     productid="$(printf '%s\n' "${raw}" | sed -n 's/^ups.productid: //p' | head -n1)"
+
+    [[ -n "${vendorid}" ]] || vendorid="$(printf '%s\n' "${raw}" | sed -n 's/^driver.parameter.vendorid: //p' | head -n1)"
+    [[ -n "${productid}" ]] || productid="$(printf '%s\n' "${raw}" | sed -n 's/^driver.parameter.productid: //p' | head -n1)"
+
     fp="$(powercycle_fingerprint "${raw}")"
 
     if [[ "${has_return}" == "1" ]] \
@@ -1273,7 +1292,7 @@ if [[ "${POWERCYCLE_ENABLED:-0}" == "1" && -r "${CAP}" ]]; then
 
     CURRENT_FP="$(
         printf '%s\n' "${RAW}" |
-            grep -E '^(device\.mfr|device\.model|device\.serial|ups\.mfr|ups\.model|ups\.serial|ups\.vendorid|ups\.productid|driver\.name|driver\.version\.data):' |
+            grep -E '^(device\.mfr|device\.model|device\.serial|ups\.mfr|ups\.model|ups\.serial|ups\.vendorid|ups\.productid|driver\.parameter\.vendorid|driver\.parameter\.productid|driver\.name|driver\.version\.data):' |
             sort |
             sha256sum |
             awk '{print $1}'
