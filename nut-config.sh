@@ -342,8 +342,8 @@ require_safe_change_window() {
 }
 
 backup_now() {
-    local d="${CFG_BACKUPS}/config-$(date +%Y%m%d-%H%M%S)"
-    mkdir -p "${d}"
+    local d
+    d="$(mktemp -d "${CFG_BACKUPS}/config-$(date +%Y%m%d-%H%M%S)-XXXXXX")"
     chmod 0700 "${d}"
 
     for f in \
@@ -1149,7 +1149,7 @@ rotate_credential() {
 # ------------------------------------------------------------------------------
 
 CAPABILITY_FILE="/etc/nut/qtronic-powercycle-capability.json"
-POWERCYCLE_FLAG="/etc/nut/qtronic-powercycle-fsd-ok"
+POWERCYCLE_FLAG="/run/qtronic-nut-powercycle-fsd-ok"
 CUSTOM_HOOK_NAME="qtronic-nut-powercycle"
 
 powercycle_fingerprint() {
@@ -1280,7 +1280,7 @@ set -u
 
 SETTINGS="/etc/nut/qtronic-settings.env"
 CAP="/etc/nut/qtronic-powercycle-capability.json"
-FLAG="/etc/nut/qtronic-powercycle-fsd-ok"
+FLAG="/run/qtronic-nut-powercycle-fsd-ok"
 
 [[ -r "${SETTINGS}" ]] && source "${SETTINGS}"
 
@@ -1307,7 +1307,7 @@ if [[ "${POWERCYCLE_ENABLED:-0}" == "1" && -r "${CAP}" ]]; then
        && printf '%s\n' "${CMDS}" | grep -Eq '^shutdown\.return([[:space:]]|$)'; then
         {
             echo "fingerprint=${CURRENT_FP}"
-            echo "created=$(date -Is)"
+            echo "created_epoch=$(date +%s)"
         } > "${FLAG}.tmp"
         chown root:root "${FLAG}.tmp"
         chmod 0600 "${FLAG}.tmp"
@@ -1342,13 +1342,36 @@ EOF_WRAP
 # Bez prywatnego flagu stworzonego podczas prawdziwego FSD nic nie robi.
 
 SETTINGS="/etc/nut/qtronic-settings.env"
-FLAG="/etc/nut/qtronic-powercycle-fsd-ok"
+FLAG="/run/qtronic-nut-powercycle-fsd-ok"
 
 [ -r "\${SETTINGS}" ] || exit 0
 . "\${SETTINGS}"
 
+# Hooki systemd-shutdown dostają: poweroff/halt/reboot/kexec.
+# Power-cycle UPS wolno wykonać wyłącznie po naszym FSD i przy poweroff.
+[ "\${1:-}" = "poweroff" ] || exit 0
 [ "\${POWERCYCLE_ENABLED:-0}" = "1" ] || exit 0
 [ -s "\${FLAG}" ] || exit 0
+
+created_epoch=""
+fingerprint=""
+. "\${FLAG}" 2>/dev/null || exit 0
+
+case "\${created_epoch}" in
+    ''|*[!0-9]*) exit 0 ;;
+esac
+
+now_epoch="$(date +%s 2>/dev/null || echo 0)"
+case "\${now_epoch}" in
+    ''|*[!0-9]*) exit 0 ;;
+esac
+
+age=$((now_epoch - created_epoch))
+[ "\${age}" -ge 0 ] 2>/dev/null || exit 0
+[ "\${age}" -le 900 ] 2>/dev/null || exit 0
+
+# Zużywamy flagę przed komendą, aby nie mogła zostać użyta drugi raz.
+rm -f "\${FLAG}" 2>/dev/null || true
 
 ${logger_bin:-/usr/bin/logger} -t Q-Tronic-NUT \
     "Late shutdown: upsdrvctl shutdown \${UPS_NAME:-powerwalker}" 2>/dev/null || true
@@ -1362,25 +1385,11 @@ EOF_HOOK
     chown root:root "${hook}"
     chmod 0755 "${hook}"
 
-    # Stary flag nigdy nie może przeżyć normalnego startu systemu.
-    cat > /etc/systemd/system/qtronic-nut-powercycle-clear.service <<EOF_CLEAR
-[Unit]
-Description=Q-Tronic clear stale UPS power-cycle flag
-After=local-fs.target
-Before=nut-monitor.service
-
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/rm -f ${POWERCYCLE_FLAG}
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF_CLEAR
-
-    systemctl daemon-reload
-    systemctl enable qtronic-nut-powercycle-clear.service >/dev/null 2>&1 || true
-    rm -f "${POWERCYCLE_FLAG}" 2>/dev/null || true
+    # Migracja ze starszej wersji, która używała trwałej flagi w /etc.
+    systemctl disable qtronic-nut-powercycle-clear.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/qtronic-nut-powercycle-clear.service
+    rm -f /etc/nut/qtronic-powercycle-fsd-ok "${POWERCYCLE_FLAG}" 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
 }
 
 remove_powercycle_runtime() {
@@ -1389,6 +1398,7 @@ remove_powercycle_runtime() {
         /usr/lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} \
         /lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} \
         "${POWERCYCLE_FLAG}" \
+        /etc/nut/qtronic-powercycle-fsd-ok \
         2>/dev/null || true
 
     systemctl disable qtronic-nut-powercycle-clear.service >/dev/null 2>&1 || true
@@ -1527,8 +1537,12 @@ mqtt_cmd() {
             chown root:nut "${tmp}"
             chmod 0640 "${tmp}"
             mv -f "${tmp}" /etc/nut/nut-mqtt.json
-            systemctl restart nut-mqtt.service
-            ok "MQTT interval=${sec}s"
+            if systemctl is-active --quiet nut-mqtt.service 2>/dev/null; then
+                systemctl restart nut-mqtt.service
+                ok "MQTT interval=${sec}s; usługa zrestartowana."
+            else
+                ok "MQTT interval=${sec}s; usługa pozostaje wyłączona."
+            fi
             ;;
         *)
             die "nut-config mqtt setup|status|show|disable|interval N"

@@ -160,7 +160,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y \
     nut nut-client nut-server \
-    usbutils openssl iproute2 \
+    usbutils openssl iproute2 procps \
     python3 python3-paho-mqtt \
     jq logrotate util-linux
 
@@ -1667,7 +1667,7 @@ Bezpieczna instrukcja testu:
 Restart/ponowna walidacja NUT po podłączeniu UPS:
   nut-restart
 
-Pełny raport do wysłania do ChatGPT:
+Pełny raport diagnostyczny:
   nut-report
 
 Dane do Home Assistant:
@@ -1760,7 +1760,7 @@ echo "  nut-report"
 echo "  nut-ha-info"
 echo "  nut-mqtt-config"
 echo
-echo "Najważniejsza komenda do wysłania wyniku do ChatGPT:"
+echo "Raport diagnostyczny:"
 echo "  nut-report"
 echo
 echo "Dane HA:"

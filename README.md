@@ -1,79 +1,56 @@
 # Proxmox NUT PowerWalker
 
+Bezpieczna integracja UPS z **Proxmox VE** przy użyciu **Network UPS Tools (NUT)**, z opcjonalnym monitoringiem w **Home Assistant** i przez **MQTT**.
+
+Projekt jest przygotowany przede wszystkim dla **PowerWalker VI 2200 STL FR**. Może działać także z innymi UPS-ami USB HID obsługiwanymi przez NUT, ale możliwości zależą od konkretnego modelu, firmware i sterownika.
+
 Autor: **Q-Tronic**
 
-Bezpieczna konfiguracja UPS dla **Proxmox VE**, **Network UPS Tools (NUT)**, **Home Assistant** i opcjonalnego **MQTT**.
+## Najważniejsze założenia
 
-Projekt został przygotowany przede wszystkim pod **PowerWalker VI 2200 STL FR**, ale instalator nie zakłada na sztywno jednego identyfikatora USB. Próbuje wykryć urządzenie przez `nut-scanner`, obsługuje znany wariant HID `0764:0601`, a przy niejednoznacznym wykryciu zatrzymuje się zamiast zgadywać.
+- decyzję o shutdownie podejmuje lokalnie NUT na hoście Proxmox;
+- Home Assistant i MQTT nie są wymagane do bezpiecznego wyłączenia serwera;
+- domyślnie shutdown następuje po **60 sekundach ciągłej pracy na baterii**;
+- jeśli zasilanie wróci przed upływem timera, shutdown jest anulowany;
+- `LOWBATT` może rozpocząć natychmiastowy FSD;
+- `nut-monitor` jest aktywowany dopiero po potwierdzeniu komunikacji z UPS-em i stabilnego statusu `OL`;
+- fizyczny power-cycle UPS-a jest domyślnie **wyłączony**;
+- konfiguracja power-cycle jest odblokowywana dopiero po sprawdzeniu możliwości aktualnie podłączonego UPS-a.
 
-## Co robi instalator
+## Wymagania
 
-- instaluje NUT i wymagane narzędzia,
-- robi backup istniejącego `/etc/nut`,
-- nie nadpisuje obcej konfiguracji bez `FORCE=1`,
-- automatycznie wykrywa UPS USB,
-- konfiguruje `usbhid-ups` lub sterownik wskazany przez `nut-scanner`,
-- wystawia NUT dla Home Assistanta,
-- generuje osobne losowe hasła,
-- ustawia shutdown po **60 sekundach ciągłej pracy na baterii**,
-- anuluje timer, jeśli sieć wróci,
-- natychmiast rozpoczyna FSD przy `LOWBATT`,
-- uzbraja `nut-monitor` **dopiero po poprawnym odczycie `ups.status`**,
-- tworzy komendy diagnostyczne,
-- prowadzi niewielkie, rotowane logi zdarzeń,
-- może publikować telemetrię do MQTT przez Home Assistant MQTT Discovery.
+- Proxmox VE / Debian z `systemd`;
+- dostęp `root`;
+- UPS podłączony do hosta przez USB;
+- dostęp do Internetu podczas instalacji pakietów i pobrania skryptów.
 
-## Ochrona przed przypadkowym odcięciem
+Skrypt instaluje wymagane pakiety NUT i narzędzia pomocnicze.
 
-Instalator nigdy nie aktywuje power-cycle sam z siebie. Funkcja pozostaje `OFF`, dopóki `nut-config powercycle probe` nie potwierdzi obsługi na konkretnej sztuce i użytkownik nie wykona `nut-config powercycle enable`.
+## Instalacja
 
-## Instalacja na Proxmoxie
-
-Najprościej: zaloguj się jako `root` przez SSH i uruchom jedną komendę:
+Uruchom jako `root` na hoście Proxmox:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/Q-Tronic/proxmox-nut-powerwalker/main/install.sh)
 ```
 
-`install.sh` jest małym bootstrapem: pobiera właściwy `setup-nut-powerwalker-proxmox.sh` oraz `nut-config.sh`, sprawdza ich oznaczenia i składnię `bash -n`, zapisuje kopie w `/root`, uruchamia główny instalator, a następnie instaluje centralny konfigurator `nut-config`.
+Instalator:
 
-Jeśli na Proxmoxie nie ma `curl`, najpierw:
+1. wykonuje backup istniejącej konfiguracji NUT;
+2. nie nadpisuje obcej konfiguracji bez jawnego `FORCE=1`;
+3. próbuje wykryć UPS przez `nut-scanner`;
+4. konfiguruje NUT;
+5. sprawdza komunikację przez `upsc`;
+6. aktywuje `nut-monitor` tylko wtedy, gdy UPS odpowiada i raportuje stabilne `OL`;
+7. instaluje `nut-config`, który służy do późniejszej konfiguracji.
 
-```bash
-apt update && apt install -y curl ca-certificates
-```
-
-Jeśli chcesz np. 120 sekund zamiast domyślnych 60:
-
-```bash
-SHUTDOWN_DELAY=120 bash <(curl -fsSL https://raw.githubusercontent.com/Q-Tronic/proxmox-nut-powerwalker/main/install.sh)
-```
-
-Możesz także przypiąć instalację do konkretnego tagu, brancha albo commita:
+Po zakończeniu sprawdź:
 
 ```bash
-QTRONIC_REF=v1.0.0 bash <(curl -fsSL https://raw.githubusercontent.com/Q-Tronic/proxmox-nut-powerwalker/main/install.sh)
+nut-status
 ```
-
-### Alternatywnie: instalacja przez `git clone`
-
-```bash
-apt update
-apt install -y git
-cd /root
-git clone https://github.com/Q-Tronic/proxmox-nut-powerwalker.git
-cd proxmox-nut-powerwalker
-bash ./setup-nut-powerwalker-proxmox.sh
-```
-
 
 ## Konfiguracja po instalacji
-
-Po instalacji nie musisz ponownie edytować skryptów. Centralnym poleceniem jest:
-
-```bash
-nut-config
-```
 
 Aktualne ustawienia:
 
@@ -81,13 +58,21 @@ Aktualne ustawienia:
 nut-config show
 ```
 
-Menu:
+Menu interaktywne:
 
 ```bash
 nut-config menu
 ```
 
-Najczęstsza zmiana — czas przed automatycznym shutdownem:
+Pełna lista dostępnych poleceń:
+
+```bash
+nut-config help
+```
+
+### Czas do shutdownu
+
+Przykłady:
 
 ```bash
 nut-delay 90
@@ -95,353 +80,276 @@ nut-delay 2m
 nut-delay 1h
 ```
 
-Samo:
+Aktualna wartość:
 
 ```bash
 nut-delay
 ```
 
-pokazuje aktualną wartość.
+### Polityka shutdownu
 
-Polityka shutdownu:
+Timer po przejściu na baterię:
 
 ```bash
 nut-config timed on
 nut-config timed off
+```
 
+Reakcja na `LOWBATT`:
+
+```bash
 nut-config lowbatt on
 nut-config lowbatt off
 ```
 
-Dostęp NUT dla Home Assistanta:
+Wyłączenie reakcji na `LOWBATT` zmniejsza poziom ochrony hosta i powinno być wykonywane świadomie.
+
+### Dostęp NUT z sieci LAN
+
+Automatycznie użyj adresu LAN hosta:
 
 ```bash
 nut-config listen auto
-nut-config listen off
-nut-config listen 192.168.1.10
+```
 
+Wyłącz dostęp NUT z LAN:
+
+```bash
+nut-config listen off
+```
+
+Ustaw konkretny adres:
+
+```bash
+nut-config listen 192.168.1.10
+```
+
+Port dla klientów LAN / Home Assistant:
+
+```bash
 nut-config port 3493
 ```
 
-Ważna decyzja projektowa: lokalny control-plane NUT pozostaje zawsze na `127.0.0.1:3493`. Zmieniany port dotyczy tylko dostępu z LAN/Home Assistanta. Dzięki temu zmiana portu HA nie rozłącza `upsmon`, lokalnego monitoringu ani MQTT.
+Lokalna komunikacja NUT na hoście pozostaje na `127.0.0.1:3493`.
 
-Zaawansowane czasy NUT:
+## Home Assistant
 
-```bash
-nut-config set POLLFREQ 5
-nut-config set POLLFREQALERT 5
-nut-config set HOSTSYNC 15
-nut-config set DEADTIME 15
-nut-config set FINALDELAY 5
-nut-config set RBWARNTIME 43200
-nut-config set NOCOMMWARNTIME 300
-```
+Najprostszy wariant to oficjalna integracja **Network UPS Tools (NUT)**.
 
-USB/sterownik UPS:
+Wyświetl dane połączenia:
 
 ```bash
-nut-config ups show
-nut-config ups auto
-
-nut-config usb 0764 0601
-nut-config usb auto auto
-
-nut-config set UPS_DESC "PowerWalker VI 2200 STL FR"
-nut-config set UPS_DRIVER usbhid-ups
-nut-config set UPS_PORT auto
-nut-config set UPS_SUBDRIVER "CyberPower HID"
+nut-ha-info
 ```
 
-Logi:
+Następnie w Home Assistant:
 
-```bash
-nut-config set LOG_ROTATE_SIZE 512k
-nut-config set LOG_ROTATE_COUNT 6
-nut-config logs 100
+**Ustawienia → Urządzenia i usługi → Dodaj integrację → Network UPS Tools (NUT)**
+
+Użyj hosta, portu, użytkownika i hasła pokazanych przez `nut-ha-info`. Dla Home Assistanta warto używać stałego adresu IP, rezerwacji DHCP albo stabilnej nazwy DNS.
+
+Konto `homeassistant` jest przeznaczone do monitoringu. Projekt nie przyznaje mu uprawnień do wykonywania poleceń UPS, dzięki czemu Home Assistant nie steruje procedurą shutdownu hosta.
+
+Dodatkowe przykłady znajdują się w katalogu:
+
+```text
+home-assistant/
 ```
 
-Home Assistant:
+## MQTT
 
-```bash
-nut-config ha show
-nut-config ha rotate
-```
+MQTT jest opcjonalny. Nie jest używany do podejmowania decyzji o shutdownie.
 
-Można również obrócić hasło lokalnego użytkownika monitorującego NUT:
-
-```bash
-nut-config primary rotate
-```
-
-MQTT:
+Konfiguracja:
 
 ```bash
 nut-config mqtt setup
+```
+
+Status:
+
+```bash
 nut-config mqtt status
+```
+
+Podgląd konfiguracji bez hasła:
+
+```bash
 nut-config mqtt show
+```
+
+Zmiana interwału publikacji:
+
+```bash
 nut-config mqtt interval 15
+```
+
+Wyłączenie mostu:
+
+```bash
 nut-config mqtt disable
 ```
 
-Monitor:
+Most publikuje telemetrię UPS i korzysta z Home Assistant MQTT Discovery. Nie publikuje topiców sterujących UPS-em.
 
-```bash
-nut-config monitor status
-nut-config monitor enable
-nut-config monitor disable
-```
+## Power-cycle UPS
 
-Backup i rollback:
+Power-cycle jest funkcją opcjonalną i domyślnie pozostaje wyłączony.
 
-```bash
-nut-config backup
-nut-config rollback
-```
+Jego zadaniem jest umożliwienie pełnego odcięcia wyjścia UPS po bezpiecznym shutdownie hosta, a następnie ponownego zasilenia po powrocie sieci. Automatyczny start serwera po powrocie AC wymaga odpowiedniego ustawienia BIOS/UEFI, np. **Restore on AC Power Loss / Power On**.
 
-Diagnostyka:
-
-```bash
-nut-config report
-nut-config capabilities
-nut-config powercycle status
-```
-
-Każda normalna zmiana konfiguracji tworzy backup. Jeśli aktywny `nut-monitor` widzi `OB` albo utracił komunikację z UPS-em, konfigurator odmawia przeładowania ustawień. Po zmianie wymagane jest stabilne `OL`; jeśli walidacja się nie powiedzie, konfigurator przywraca poprzednią konfigurację.
-
-`UPS_NAME` pozostaje stałym identyfikatorem logicznym. To celowe: zapobiega rozjechaniu odwołań pomiędzy NUT, MQTT i Home Assistantem. Opis urządzenia, sterownik, port urządzenia, VID/PID, subdriver, polityka shutdownu, sieć, timingi, logowanie, MQTT i hasła można zmieniać po instalacji.
-
-Power-cycle UPS jest domyślnie **wyłączony** i ma osobną bramkę sprzętową.
-
-Najpierw:
+### 1. Sprawdzenie możliwości
 
 ```bash
 nut-config powercycle probe
 ```
 
-`probe` tylko odczytuje możliwości bieżącego UPS-a. Wymagana jest jawna obsługa `shutdown.return`; sprawdzane są też sterownik, fingerprint urządzenia, delaye i obecność `upsdrvctl`.
+`probe` jest operacją odczytową. Nie wysyła `shutdown.return` i nie odcina zasilania.
 
-Dopiero po pozytywnym wyniku:
+Power-cycle może zostać odblokowany tylko wtedy, gdy aktualny UPS raportuje wymaganą możliwość, w szczególności `shutdown.return`.
 
-```bash
-nut-config powercycle enable
-```
+> Sam fakt raportowania komendy przez firmware nie gwarantuje jej poprawnego fizycznego działania. Pierwszy rzeczywisty test należy wykonać pod nadzorem.
 
-`enable` ponownie wykonuje probe. Podczas konfiguracji **nie jest wykonywany testowy `shutdown.return`**, bo taki test może faktycznie odciąć zasilanie.
+### 2. Opóźnienia
 
-Przykładowe delaye:
+Przykład:
 
 ```bash
 nut-config powercycle delays 60 300
 ```
 
-Dla `usbhid-ups` są zapisywane jako `offdelay` i `ondelay`. Konfigurator wymusza minimum 60 s dla OFF, 120 s dla ON oraz `ON > OFF`.
+Dla `usbhid-ups` odpowiada to odpowiednio `offdelay` i `ondelay`.
 
-Status/wyłączenie:
+### 3. Aktywacja
+
+```bash
+nut-config powercycle enable
+```
+
+Przy aktywacji oraz przed końcowym power-cycle skrypt ponownie sprawdza bieżący sprzęt i jego możliwości. Jeśli walidacja nie przejdzie, host może się bezpiecznie wyłączyć bez odcinania wyjścia UPS.
+
+Status:
 
 ```bash
 nut-config powercycle status
+```
+
+Wyłączenie:
+
+```bash
 nut-config powercycle disable
 ```
 
-Przy prawdziwym FSD `SHUTDOWNCMD` uruchamia dodatkowy wrapper. Wrapper ponownie porównuje fingerprint aktualnego urządzenia z tym zapamiętanym podczas probe i jeszcze raz sprawdza `shutdown.return`. Dopiero wtedy uzbraja późny hook `systemd-shutdown`, który wykonuje `upsdrvctl shutdown` po zakończeniu normalnej sekwencji zamykania systemu.
+## Pierwszy test zaniku zasilania
 
-## Najważniejsze komendy po instalacji
+Wyświetl przygotowaną procedurę:
 
 ```bash
-nut-status
+nut-test-guide
 ```
 
-Czytelny status UPS i usług.
+Do podglądu statusu:
 
 ```bash
 nut-watch
 ```
 
-Status odświeżany na żywo.
+Podczas pierwszego testu odłącz **zasilanie wejściowe UPS-a od sieci**, a nie przewód serwera od UPS-a.
+
+Sprawdź przejście:
+
+```text
+OL -> OB -> OL
+```
+
+i przywróć zasilanie przed upływem skonfigurowanego timera shutdownu.
+
+Nie wykonuj ręcznie `upsmon -c fsd`, `shutdown.return` ani `load.off` jako zwykłego testu działającego serwera.
+
+## Diagnostyka
+
+Status:
+
+```bash
+nut-status
+```
+
+Pełne dane i możliwości UPS:
 
 ```bash
 nut-capabilities
 ```
 
-Pełne `upsc`, `upscmd -l` i `upsrw`.
-
-```bash
-nut-phase2-check
-```
-
-Sprawdza bez wykonywania komend, czy UPS raportuje m.in. `shutdown.return`, `load.on.delay`, `ups.delay.start`.
+Logi:
 
 ```bash
 nut-logs 100
 ```
 
-Ostatnie logi NUT/MQTT. Maksymalnie można poprosić o 500 linii.
+Raport diagnostyczny:
 
 ```bash
 nut-report
 ```
 
-Najważniejsza komenda diagnostyczna. Generuje raport, ukrywa hasło NUT i wyświetla dane, które można wkleić do ChatGPT.
+Raport ukrywa hasło z wpisu `MONITOR`, ale może zawierać adresy IP, dane systemu, identyfikatory USB lub numer seryjny UPS-a. Przejrzyj go przed opublikowaniem.
+
+## Aktualizacja
+
+Aby pobrać aktualną wersję projektu, uruchom ponownie:
 
 ```bash
-nut-ha-info
+bash <(curl -fsSL https://raw.githubusercontent.com/Q-Tronic/proxmox-nut-powerwalker/main/install.sh)
 ```
 
-Wyświetla dane potrzebne do konfiguracji Home Assistanta.
+Instalator zachowuje wygenerowane dane dostępowe i tworzy backup przed zmianą konfiguracji.
 
-```bash
-nut-mqtt-config
+Aktualizację najlepiej wykonywać przy stabilnym zasilaniu i statusie UPS `OL`.
+
+## Backup i rollback
+
+Backup instalatora znajduje się w:
+
+```text
+/root/nut-powerwalker/backups/
 ```
 
-Konfiguruje opcjonalny most NUT → MQTT.
+Backup zmian wykonywanych przez `nut-config`:
 
-```bash
-nut-test-guide
+```text
+/root/nut-powerwalker/config-backups/
 ```
 
-Wyświetla bezpieczną procedurę pierwszego testu zaniku zasilania.
+Przywrócenie ostatniej konfiguracji utworzonej przez instalator:
 
 ```bash
 nut-rollback
 ```
 
-Przywraca backup `/etc/nut` wykonany przed ostatnim uruchomieniem instalatora.
+Rollback przywraca konfigurację NUT; nie jest pełnym deinstalatorem pakietów i wszystkich plików pomocniczych.
 
-## Home Assistant
+## Bezpieczeństwo
 
-Szczegóły są w:
+- nie wystawiaj portu NUT do Internetu;
+- ogranicz dostęp do zaufanego LAN/VLAN i odpowiednich reguł firewalla;
+- nie publikuj `/root/nut-powerwalker/credentials.env`;
+- nie publikuj `/etc/nut/nut-mqtt.json`;
+- przed udostępnieniem `nut-report` przejrzyj zawartość raportu;
+- nie aktywuj power-cycle bez pozytywnego `probe` i kontrolowanego testu konkretnego UPS-a.
 
-```text
-home-assistant/README.md
-```
+## Zgodność
 
-Podstawowa integracja:
+Głównym urządzeniem docelowym jest **PowerWalker VI 2200 STL FR**.
 
-**Ustawienia → Urządzenia i usługi → Dodaj integrację → Network UPS Tools (NUT)**
+Instalator próbuje automatycznie wykryć urządzenie USB i zawiera obsługę znanego wariantu `0764:0601`. Inne urządzenia zgodne z NUT mogą działać, ale projekt nie zakłada pełnej kompatybilności ze wszystkimi UPS-ami.
 
-Dane pokaże:
+Obsługa telemetrii, komend i power-cycle zależy od:
 
-```bash
-nut-ha-info
-```
+- modelu i firmware UPS-a;
+- wersji NUT;
+- użytego sterownika / subdrivera;
+- możliwości raportowanych przez urządzenie.
 
-Port NUT `3493/TCP` powinien być dostępny tylko w zaufanej sieci LAN/VLAN. **Nie wystawiaj go do Internetu.**
+## Licencja
 
-## MQTT
-
-MQTT jest opcjonalne. NUT działa bez niego.
-
-Konfiguracja:
-
-```bash
-nut-mqtt-config
-```
-
-Po poprawnym teście połączenia instalator uruchomi:
-
-```bash
-systemctl status nut-mqtt.service
-```
-
-Most publikuje jeden JSON stanu co kilkanaście sekund oraz konfigurację Home Assistant MQTT Discovery. Nie publikuje komend sterujących UPS-em.
-
-## Logi
-
-Własne logi:
-
-```text
-/var/log/nut-powerwalker/events.log
-/var/log/nut-powerwalker/mqtt.log
-```
-
-Logi są obracane przez `logrotate` po osiągnięciu około `512 kB`; przechowywanych jest 6 rotacji z kompresją.
-
-## Pliki na serwerze
-
-Po instalacji:
-
-```text
-/root/nut-powerwalker/
-```
-
-Znajdziesz tam m.in.:
-
-```text
-credentials.env
-HA-SETUP.txt
-COMMANDS.txt
-README-SERVER.txt
-backups/
-reports/
-```
-
-Hasła mają prawa `600` i nie są częścią repozytorium GitHub.
-
-## Pierwszy test
-
-Najpierw:
-
-```bash
-nut-test-guide
-```
-
-Przy pierwszym teście **nie czekaj pełnych 60 sekund**. Odłącz od sieci 230 V tylko wejście UPS-a i przywróć zasilanie wcześniej. Sprawdź przejście `OL → OB → OL`.
-
-Nie uruchamiaj ręcznie:
-
-```bash
-upsmon -c fsd
-```
-
-ani poleceń `shutdown.return`/`load.off` bez osobnej weryfikacji.
-
----
-
-# Jak wrzucić repozytorium na GitHuba z telefonu
-
-Najprościej zrobić to w przeglądarce telefonu na `github.com`.
-
-1. Zaloguj się do GitHuba.
-2. Utwórz nowe repozytorium, np.:
-   `proxmox-nut-powerwalker`
-3. Możesz ustawić je jako **Private** albo **Public**. Repo nie zawiera żadnych wygenerowanych haseł.
-4. Wejdź do pustego repozytorium.
-5. Wybierz **Add file → Upload files**.
-6. Wgraj:
-   - `install.sh`
-   - `nut-config.sh`
-   - `setup-nut-powerwalker-proxmox.sh`
-   - `README.md`
-   - `.gitignore`
-   - `LICENSE`
-   - folder `home-assistant` wraz z plikami.
-7. W polu opisu commita wpisz np.:
-   `Initial Q-Tronic NUT setup`
-8. Zatwierdź **Commit changes**.
-
-Jeśli mobilny interfejs GitHuba nie pokazuje wygodnie `Upload files`, włącz w przeglądarce **wersję strony na komputer**. Do samego wgrywania plików przeglądarka jest zwykle wygodniejsza niż aplikacja GitHub.
-
-## Użycie repo na Proxmoxie
-
-Dla tego publicznego repo najprościej:
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Q-Tronic/proxmox-nut-powerwalker/main/install.sh)
-```
-
-Nie trzeba robić `git clone`, `cd` ani `chmod`.
-
-## Aktualizacja później
-
-Aby pobrać aktualną wersję instalatora z brancha `main`, po prostu uruchom tę samą komendę ponownie:
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Q-Tronic/proxmox-nut-powerwalker/main/install.sh)
-```
-
-Główny instalator zachowa istniejące wygenerowane hasła i przed zmianami wykona kolejny backup konfiguracji NUT.
-
-
-## GitHub z telefonu
-
-Szczegółowa instrukcja znajduje się w `GITHUB-MOBILE.md`.
+MIT — szczegóły w pliku `LICENSE`.
