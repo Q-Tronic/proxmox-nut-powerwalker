@@ -400,6 +400,81 @@ resolve_backup_ref() {
     printf '%s\n' "${d}"
 }
 
+validate_backup_v2() {
+    local d="$1" line target state encoded unit active_field enabled_field
+    local -a expected_files=(
+        "${SETTINGS}"
+        /etc/nut/ups.conf
+        /etc/nut/upsd.conf
+        /etc/nut/upsd.users
+        /etc/nut/upsmon.conf
+        /etc/nut/upssched.conf
+        "${LOGROTATE}"
+        "${CREDS}"
+        /etc/nut/nut-mqtt.json
+        /etc/nut/qtronic-powercycle-capability.json
+    )
+    local -a expected_units=(nut-monitor.service nut-mqtt.service "${WATCHDOG_TIMER}")
+    local -A allowed_files=() seen_files=() allowed_units=() seen_units=()
+
+    [[ -f "${d}/backup-format.txt" ]] \
+        && [[ ! -L "${d}/backup-format.txt" ]] \
+        && grep -qx 'format=2' "${d}/backup-format.txt" \
+        || { warn "Backup v2 jest niekompletny (brak manifestu)."; return 2; }
+    [[ -f "${d}/file-state.txt" && ! -L "${d}/file-state.txt" ]] \
+        || { warn "Backup v2 jest niekompletny (brak manifestu)."; return 2; }
+    [[ -f "${d}/service-state.txt" && ! -L "${d}/service-state.txt" ]] \
+        || { warn "Backup v2 jest niekompletny (brak manifestu)."; return 2; }
+
+    for target in "${expected_files[@]}"; do
+        allowed_files["${target}"]=1
+    done
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        IFS=$'\t' read -r target state extra <<< "${line}"
+        [[ -n "${target}" && -n "${state}" && -z "${extra:-}" ]] \
+            || { warn "Nieoczekiwana ścieżka w manifeście backupu: ${line:-<pusta>}."; return 2; }
+        [[ -n "${allowed_files[${target}]:-}" && -z "${seen_files[${target}]:-}" ]] \
+            || { warn "Nieoczekiwana ścieżka w manifeście backupu: ${target}."; return 2; }
+        [[ "${state}" == "present" || "${state}" == "absent" ]] \
+            || { warn "Nieprawidłowy stan pliku w manifeście backupu: ${target}."; return 2; }
+        seen_files["${target}"]=1
+        encoded="${d}/$(printf '%s' "${target}" | sed 's#^/##; s#/#__#g')"
+        if [[ "${state}" == "present" ]]; then
+            [[ -f "${encoded}" && ! -L "${encoded}" ]] \
+                || { warn "Backup oznacza ${target} jako present, ale brak bezpiecznej kopii."; return 2; }
+        elif [[ -e "${encoded}" || -L "${encoded}" ]]; then
+            warn "Backup oznacza ${target} jako absent, ale zawiera kopię."
+            return 2
+        fi
+    done < "${d}/file-state.txt"
+    for target in "${expected_files[@]}"; do
+        [[ -n "${seen_files[${target}]:-}" ]] \
+            || { warn "Backup v2 jest niekompletny (brak manifestu)."; return 2; }
+    done
+
+    for unit in "${expected_units[@]}"; do
+        allowed_units["${unit}"]=1
+    done
+    while IFS=$'\t' read -r unit active_field enabled_field extra || [[ -n "${unit}" ]]; do
+        [[ -n "${unit}" && -n "${active_field}" && -n "${enabled_field}" && -z "${extra:-}" ]] \
+            || { warn "Manifest usług backupu v2 jest niekompletny lub zduplikowany."; return 2; }
+        [[ -n "${allowed_units[${unit}]:-}" ]] \
+            || { warn "Nieoczekiwana jednostka w manifeście backupu: ${unit}."; return 2; }
+        [[ -z "${seen_units[${unit}]:-}" ]] \
+            || { warn "Manifest usług backupu v2 jest niekompletny lub zduplikowany."; return 2; }
+        active="${active_field#active=}"
+        enabled="${enabled_field#enabled=}"
+        [[ "${active_field}" == "active=${active}" && "${enabled_field}" == "enabled=${enabled}" ]] \
+            && is_bool "${active}" && is_bool "${enabled}" \
+            || { warn "Nieprawidłowy stan jednostki w manifeście backupu: ${unit}."; return 2; }
+        seen_units["${unit}"]=1
+    done < "${d}/service-state.txt"
+    for unit in "${expected_units[@]}"; do
+        [[ -n "${seen_units[${unit}]:-}" ]] \
+            || { warn "Manifest usług backupu v2 jest niekompletny lub zduplikowany."; return 2; }
+    done
+}
+
 backup_restore_cmd() {
     local ref="${1:-LAST}" target safety target_powercycle=0 rollback_ok=1
     require_normal_mode
@@ -408,8 +483,26 @@ backup_restore_cmd() {
     require_safe_change_window
     target="$(resolve_backup_ref "${ref}")" || die "Nie znaleziono backupu: ${ref}. Użyj: nut-config backup list"
 
+    if [[ -e "${target}/backup-format.txt" || -e "${target}/file-state.txt" ]]; then
+        validate_backup_v2 "${target}" || die "Wybrany backup v2 nie przeszedł walidacji."
+    fi
+
     if grep -Eq '^POWERCYCLE_ENABLED=(1|\?1)$' "${target}/etc__nut__qtronic-settings.env" 2>/dev/null; then
         target_powercycle=1
+
+        if [[ ! -f "${target}/etc__nut__qtronic-powercycle-capability.json" ]] \
+            || ! python3 - "${target}/etc__nut__qtronic-powercycle-capability.json" <<'PY_BACKUP_CAPABILITY'
+import json, re, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        fingerprint = json.load(stream).get("fingerprint", "")
+except (OSError, ValueError, AttributeError):
+    raise SystemExit(1)
+raise SystemExit(0 if re.fullmatch(r"[0-9a-f]{64}", fingerprint) else 1)
+PY_BACKUP_CAPABILITY
+        then
+            die "Backup ma power-cycle=ON, ale nie zawiera własnego capability fingerprintu."
+        fi
 
         # Backup z aktywnym power-cycle może zawierać upsmon.conf wskazujący wrapper.
         # Instalujemy fail-closed runtime JESZCZE PRZED restore, aby nie powstało
@@ -520,6 +613,11 @@ restart_stack() {
 restore_backup_dir() {
     local d="$1" encoded target status line unit active enabled
     [[ -d "${d}" ]] || { warn "Brak backupu ${d}"; return 1; }
+
+    # Walidacja musi zakończyć się przed zatrzymaniem usług i przed pierwszym zapisem.
+    if [[ -e "${d}/backup-format.txt" || -e "${d}/file-state.txt" ]]; then
+        validate_backup_v2 "${d}" || return 2
+    fi
 
     systemctl stop nut-monitor.service 2>/dev/null || true
     systemctl stop nut-mqtt.service 2>/dev/null || true
@@ -727,8 +825,9 @@ apply_current() {
     validate_settings
     require_safe_change_window
 
-    local previous_monitor backup tmp result status
-    previous_monitor="$(systemctl is-active nut-monitor.service 2>/dev/null || true)"
+    local previous_monitor_active previous_monitor_enabled backup tmp result status
+    previous_monitor_active="$(service_active_bit nut-monitor.service)"
+    previous_monitor_enabled="$(service_enabled_bit nut-monitor.service)"
 
     if [[ "${POWERCYCLE_ENABLED}" == "1" ]]; then
         powercycle_probe 1 || die "Aktywny power-cycle nie przechodzi capability gate. Nie zmieniam konfiguracji."
@@ -777,11 +876,8 @@ apply_current() {
         fi
     fi
 
-    if [[ "${previous_monitor}" == "active" ]]; then
-        systemctl enable --now nut-monitor.service
-    else
-        systemctl disable --now nut-monitor.service 2>/dev/null || true
-    fi
+    restore_service_state nut-monitor.service "${previous_monitor_active}" "${previous_monitor_enabled}" \
+        || die "Nie udało się odtworzyć stanu nut-monitor.service po zmianie konfiguracji."
 
     ok "Konfiguracja zastosowana. Backup: ${backup}"
 }
@@ -1443,8 +1539,9 @@ rotate_credential() {
     load_creds
     require_safe_change_window
 
-    local previous_monitor backup new tmpdir result status
-    previous_monitor="$(systemctl is-active nut-monitor.service 2>/dev/null || true)"
+    local previous_monitor_active previous_monitor_enabled backup new tmpdir result status
+    previous_monitor_active="$(service_active_bit nut-monitor.service)"
+    previous_monitor_enabled="$(service_enabled_bit nut-monitor.service)"
     backup="$(backup_now)"
     new="$(openssl rand -hex 24)"
     tmpdir="$(mktemp -d /tmp/qtronic-nut-cred.XXXXXX)"
@@ -1484,9 +1581,8 @@ rotate_credential() {
         return 21
     fi
 
-    if [[ "${previous_monitor}" == "active" ]]; then
-        systemctl enable --now nut-monitor.service
-    fi
+    restore_service_state nut-monitor.service "${previous_monitor_active}" "${previous_monitor_enabled}" \
+        || die "Nie udało się odtworzyć stanu nut-monitor.service po rotacji hasła."
 
     ok "Hasło ${which} zmienione. Backup: ${backup}"
 }
