@@ -31,6 +31,7 @@ REPORT_DIR="${BASE}/reports"
 LOG_DIR="/var/log/nut-powerwalker"
 LOGROTATE="/etc/logrotate.d/nut-powerwalker"
 LOCK="/run/lock/qtronic-nut-config.lock"
+BYPASS_STATE="/etc/nut/qtronic-bypass-state.env"
 MARKER="# managed-by: q-tronic-nut-powerwalker-installer"
 
 die()  { echo "[BŁĄD] $*" >&2; exit 1; }
@@ -286,7 +287,7 @@ local_target() {
 }
 
 status_now() {
-    upsc "$(local_target)" 2>/dev/null | sed -n 's/^ups.status: //p' | head -n1
+    timeout 5s upsc "$(local_target)" 2>/dev/null | sed -n 's/^ups.status: //p' | head -n1
 }
 
 save_settings_to() {
@@ -714,8 +715,24 @@ TIMED_SHUTDOWN="${TIMED_SHUTDOWN:-1}"
 LOWBATT_SHUTDOWN="${LOWBATT_SHUTDOWN:-1}"
 
 if ! RAW="$(upsc "${UPS_NAME}@localhost" 2>&1)"; then
+    if [[ -f /etc/nut/qtronic-bypass-state.env ]]; then
+        echo "============================================================"
+        echo " Q-Tronic | NUT / PowerWalker"
+        echo "============================================================"
+        echo "BYPASS:          AKTYWNY"
+        echo "UPS:             celowo może być fizycznie odłączony"
+        echo "Komunikacja:     brak (oczekiwane w BYPASS po odpięciu UPS)"
+        echo "nut-monitor:     $(systemctl is-active nut-monitor.service 2>/dev/null || true)"
+        echo "nut-server:      $(systemctl is-active nut-server.service 2>/dev/null || true)"
+        echo "nut-mqtt:        $(systemctl is-active nut-mqtt.service 2>/dev/null || true)"
+        echo "------------------------------------------------------------"
+        echo "Po ponownym podłączeniu UPS uruchom: nut-config resume"
+        echo "============================================================"
+        exit 0
+    fi
     echo "BŁĄD: brak komunikacji z ${UPS_NAME}@localhost"
     echo "${RAW}"
+    echo "Jeśli UPS został odłączony celowo, użyj wcześniej: nut-config bypass enable"
     exit 1
 fi
 
@@ -740,6 +757,7 @@ echo "------------------------------------------------------------"
 echo "Timed shutdown:  $([[ "${TIMED_SHUTDOWN}" == "1" ]] && echo ON || echo OFF)"
 echo "Shutdown delay:  ${SHUTDOWN_DELAY} s"
 echo "LOWBATT action:  $([[ "${LOWBATT_SHUTDOWN}" == "1" ]] && echo shutdown || echo log-only)"
+echo "BYPASS:          $([[ -f /etc/nut/qtronic-bypass-state.env ]] && echo AKTYWNY || echo nie)"
 echo "------------------------------------------------------------"
 echo "nut-monitor:     $(systemctl is-active nut-monitor.service 2>/dev/null || true)"
 echo "nut-server:      $(systemctl is-active nut-server.service 2>/dev/null || true)"
@@ -790,6 +808,7 @@ EOF_HA
 }
 
 install_self() {
+    [[ ! -f "${BYPASS_STATE}" ]] || die "Tryb BYPASS jest aktywny. Zakończ go przez: nut-config resume — dopiero potem aktualizuj nut-config."
     command -v upsc >/dev/null 2>&1 || die "NUT nie jest jeszcze zainstalowany."
     [[ -f /etc/nut/ups.conf ]] || die "Brak /etc/nut/ups.conf."
     [[ -f /etc/nut/upsmon.conf ]] || die "Brak /etc/nut/upsmon.conf."
@@ -867,9 +886,10 @@ install_self() {
 
 show() {
     load_settings
-    local resolved status
+    local resolved status bypass
     resolved="$(resolve_listen_ip)"
     status="$(status_now || true)"
+    bypass="$([[ -f "${BYPASS_STATE}" ]] && echo TAK || echo NIE)"
 
     cat <<EOF_SHOW
 ============================================================
@@ -911,6 +931,10 @@ Power-cycle:
   offdelay:            ${POWERCYCLE_OFFDELAY} s
   ondelay:             ${POWERCYCLE_ONDELAY} s
 
+Tryb BYPASS (UPS fizycznie poza układem):
+  aktywny:             ${bypass}
+  stan:                $([[ "${bypass}" == "TAK" ]] && echo "ochrona UPS celowo wstrzymana" || echo "normalna ochrona NUT")
+
 Usługi:
   nut-server:          $(systemctl is-active nut-server.service 2>/dev/null || true)
   nut-monitor:         $(systemctl is-active nut-monitor.service 2>/dev/null || true)
@@ -923,6 +947,7 @@ EOF_SHOW
 
 set_key() {
     local key="$1" value="$2"
+    require_normal_mode
     load_settings
     load_creds
 
@@ -988,6 +1013,7 @@ set_key() {
 
 set_usb_pair() {
     [[ $# -ge 2 ]] || die "nut-config usb VID PID [SUBDRIVER]"
+    require_normal_mode
     load_settings
     load_creds
 
@@ -1005,6 +1031,7 @@ set_usb_pair() {
 }
 
 detect_ups() {
+    require_normal_mode
     load_settings
     load_creds
     require_safe_change_window
@@ -1091,6 +1118,7 @@ PY
 
 rotate_credential() {
     local which="$1"
+    require_normal_mode
     load_settings
     load_creds
     require_safe_change_window
@@ -1424,6 +1452,7 @@ powercycle_status() {
 }
 
 powercycle_enable() {
+    [[ ! -f "${BYPASS_STATE}" ]] || die "Tryb BYPASS jest aktywny. Najpierw podłącz UPS i uruchom: nut-config resume"
     load_settings
     load_creds
     require_safe_change_window
@@ -1473,6 +1502,7 @@ powercycle_enable() {
 }
 
 powercycle_disable() {
+    require_normal_mode
     load_settings
     load_creds
     require_safe_change_window
@@ -1487,6 +1517,7 @@ powercycle_disable() {
 powercycle_delays() {
     [[ $# -eq 2 ]] || die "nut-config powercycle delays OFF_SECONDS ON_SECONDS"
 
+    require_normal_mode
     load_settings
     load_creds
 
@@ -1511,6 +1542,7 @@ mqtt_cmd() {
     local sub="${1:-status}"
     case "${sub}" in
         setup|config)
+            [[ ! -f "${BYPASS_STATE}" ]] || die "Tryb BYPASS jest aktywny. Najpierw podłącz UPS i uruchom: nut-config resume"
             /usr/local/sbin/nut-mqtt-config
             ;;
         status)
@@ -1527,6 +1559,7 @@ mqtt_cmd() {
             fi
             ;;
         interval)
+            require_normal_mode
             [[ $# -eq 2 ]] || die "nut-config mqtt interval SEKUNDY"
             local sec="$2" tmp
             is_uint "${sec}" || die "Interwał musi być liczbą."
@@ -1561,6 +1594,7 @@ monitor_cmd() {
             ok "nut-monitor wyłączony."
             ;;
         enable|on)
+            [[ ! -f "${BYPASS_STATE}" ]] || die "Tryb BYPASS jest aktywny. Najpierw podłącz UPS i uruchom: nut-config resume"
             load_settings
             status="$(status_now || true)"
             printf '%s\n' "${status}" | grep -qw OL || die "Nie włączam monitora bez OL. Status: ${status:-brak}"
@@ -1574,150 +1608,771 @@ monitor_cmd() {
     esac
 }
 
+
+bypass_active() {
+    [[ -f "${BYPASS_STATE}" ]]
+}
+
+require_normal_mode() {
+    if bypass_active; then
+        die "Tryb BYPASS jest aktywny. Ta zmiana jest zablokowana. Podłącz UPS i uruchom: nut-config resume"
+    fi
+    return 0
+}
+
+service_active_bit() {
+    systemctl is-active --quiet "$1" 2>/dev/null && echo 1 || echo 0
+}
+
+service_enabled_bit() {
+    systemctl is-enabled --quiet "$1" 2>/dev/null && echo 1 || echo 0
+}
+
+restore_service_state() {
+    local unit="$1" was_active="$2" was_enabled="$3"
+
+    if [[ "${was_enabled}" == "1" ]]; then
+        systemctl enable "${unit}" >/dev/null 2>&1 || true
+    else
+        systemctl disable "${unit}" >/dev/null 2>&1 || true
+    fi
+
+    if [[ "${was_active}" == "1" ]]; then
+        systemctl start "${unit}" >/dev/null 2>&1 || true
+    else
+        systemctl stop "${unit}" >/dev/null 2>&1 || true
+    fi
+}
+
+bypass_mark_ready() {
+    local value="$1" tmp
+    is_bool "${value}" || die "Nieprawidłowy stan BYPASS_READY."
+    [[ -f "${BYPASS_STATE}" ]] || die "Brak ${BYPASS_STATE}."
+
+    tmp="$(mktemp "${BYPASS_STATE}.tmp.XXXXXX")"
+    awk '!/^BYPASS_READY=/' "${BYPASS_STATE}" > "${tmp}"
+    printf 'BYPASS_READY=%q\n' "${value}" >> "${tmp}"
+    chown root:nut "${tmp}"
+    chmod 0640 "${tmp}"
+    mv -f "${tmp}" "${BYPASS_STATE}"
+}
+
+bypass_status() {
+    local status
+    status="$(status_now || true)"
+
+    echo "============================================================"
+    echo " Q-Tronic | BYPASS / praca bez UPS"
+    echo "============================================================"
+
+    if ! bypass_active; then
+        echo "BYPASS:              NIE"
+        echo "Ochrona NUT:          tryb normalny"
+        echo "ups.status:           ${status:-brak komunikacji}"
+        echo
+        echo "Jeśli chcesz fizycznie wyjąć UPS z układu:"
+        echo "  1) upewnij się, że UPS jest OL"
+        echo "  2) uruchom: nut-config bypass enable"
+        echo "  3) dopiero potem odłącz USB i przepnij zasilanie serwera"
+        echo "============================================================"
+        return 0
+    fi
+
+    # shellcheck disable=SC1090
+    source "${BYPASS_STATE}"
+    echo "BYPASS:              TAK"
+    echo "Gotowy do odpięcia:   $([[ "${BYPASS_READY:-0}" == "1" ]] && echo TAK || echo NIE)"
+    echo "Ochrona UPS:          celowo wstrzymana"
+    echo "Włączono epoch:       ${BYPASS_ENTERED_EPOCH:-brak}"
+    echo "Poprzedni monitor:    $([[ "${PREV_MONITOR_ACTIVE:-0}" == "1" ]] && echo aktywny || echo nieaktywny)"
+    echo "Poprzedni MQTT:       $([[ "${PREV_MQTT_ACTIVE:-0}" == "1" ]] && echo aktywny || echo nieaktywny)"
+    echo "Poprzedni powercycle: $([[ "${PREV_POWERCYCLE:-0}" == "1" ]] && echo aktywny || echo nieaktywny)"
+    echo "ups.status teraz:     ${status:-brak komunikacji (normalne po odłączeniu UPS)}"
+    if [[ "${BYPASS_READY:-0}" != "1" ]]; then
+        echo
+        echo "UWAGA: BYPASS NIE zakończył przygotowania. NIE ODŁĄCZAJ UPS."
+        echo "Aby wrócić do normalnego trybu: nut-config resume"
+    fi
+    echo
+    echo "Po ponownym podłączeniu UPS uruchom:"
+    echo "  nut-config resume"
+    echo "============================================================"
+}
+
+bypass_enable() {
+    load_settings
+    load_creds
+
+    if bypass_active; then
+        warn "Tryb BYPASS jest już aktywny."
+        bypass_status
+        return 0
+    fi
+
+    local raw status fp tmp
+    local mon_active mon_enabled mqtt_active mqtt_enabled
+
+    raw="$(upsc "$(local_target)" 2>&1 || true)"
+    status="$(printf '%s\n' "${raw}" | sed -n 's/^ups.status: //p' | head -n1)"
+
+    [[ -n "${status}" ]] || die "Nie włączam BYPASS bez komunikacji z UPS. Najpierw przywróć połączenie i stabilne OL."
+    printf '%s\n' "${status}" | grep -qw OL || die "BYPASS można włączyć tylko przy stabilnym OL. Status: ${status}"
+    ! printf '%s\n' "${status}" | grep -qw OB || die "UPS raportuje OB. Nie odłączaj go teraz."
+
+    fp="$(powercycle_fingerprint "${raw}")"
+    mon_active="$(service_active_bit nut-monitor.service)"
+    mon_enabled="$(service_enabled_bit nut-monitor.service)"
+    mqtt_active="$(service_active_bit nut-mqtt.service)"
+    mqtt_enabled="$(service_enabled_bit nut-mqtt.service)"
+
+    tmp="$(mktemp "${BYPASS_STATE}.tmp.XXXXXX")"
+    {
+        printf 'BYPASS_ENTERED_EPOCH=%q\n' "$(date +%s)"
+        printf 'BYPASS_READY=%q\n' "0"
+        printf 'BYPASS_UPS_FP=%q\n' "${fp}"
+        printf 'PREV_MONITOR_ACTIVE=%q\n' "${mon_active}"
+        printf 'PREV_MONITOR_ENABLED=%q\n' "${mon_enabled}"
+        printf 'PREV_MQTT_ACTIVE=%q\n' "${mqtt_active}"
+        printf 'PREV_MQTT_ENABLED=%q\n' "${mqtt_enabled}"
+        printf 'PREV_POWERCYCLE=%q\n' "${POWERCYCLE_ENABLED}"
+    } > "${tmp}"
+    chown root:nut "${tmp}"
+    chmod 0640 "${tmp}"
+    mv -f "${tmp}" "${BYPASS_STATE}"
+
+    # Najpierw wyłączamy procesy, które reagują na utratę komunikacji.
+    systemctl disable --now nut-monitor.service >/dev/null 2>&1 || true
+    systemctl disable --now nut-mqtt.service >/dev/null 2>&1 || true
+
+    if systemctl is-active --quiet nut-monitor.service 2>/dev/null; then
+        die "Nie udało się zatrzymać nut-monitor. NIE odłączaj UPS."
+    fi
+
+    # Usuwamy późny hook/flagę zanim cokolwiek fizycznie odłączysz.
+    remove_powercycle_runtime
+
+    if [[ "${POWERCYCLE_ENABLED}" == "1" ]]; then
+        POWERCYCLE_ENABLED=0
+        if ! apply_current; then
+            warn "Nie udało się przepisać konfiguracji z wyłączonym power-cycle."
+            warn "Monitor i runtime power-cycle pozostają zatrzymane. NIE odłączaj UPS bez sprawdzenia: nut-config bypass status"
+            return 1
+        fi
+        remove_powercycle_runtime
+    fi
+
+    bypass_mark_ready 1
+
+    ok "Tryb BYPASS WŁĄCZONY I GOTOWY DO FIZYCZNEGO ODŁĄCZENIA UPS."
+    echo "nut-monitor: zatrzymany"
+    echo "nut-mqtt:    zatrzymany"
+    echo "power-cycle: wyłączony, runtime usunięty"
+    echo
+    echo "TERAZ możesz odłączyć USB UPS i przepiąć serwer bezpośrednio do sieci."
+    echo "Po ponownym podłączeniu UPS uruchom: nut-config resume"
+}
+
+bypass_resume() {
+    bypass_active || die "Tryb BYPASS nie jest aktywny. Nic nie trzeba przywracać."
+
+    load_settings
+    load_creds
+
+    # shellcheck disable=SC1090
+    source "${BYPASS_STATE}"
+
+    for v in BYPASS_READY PREV_MONITOR_ACTIVE PREV_MONITOR_ENABLED PREV_MQTT_ACTIVE PREV_MQTT_ENABLED PREV_POWERCYCLE; do
+        is_bool "${!v:-}" || die "Uszkodzony ${BYPASS_STATE}: ${v}. Nie przywracam automatycznie usług."
+    done
+
+    info "Ponownie uruchamiam stos NUT i sprawdzam podłączony UPS..."
+    systemctl stop nut-monitor.service 2>/dev/null || true
+    systemctl stop nut-mqtt.service 2>/dev/null || true
+
+    restart_stack || die "Nie udało się uruchomić sterownika/serwera NUT. BYPASS pozostaje aktywny."
+
+    local raw status current_fp powercycle_restored=1
+    raw="$(upsc "$(local_target)" 2>&1 || true)"
+    status="$(printf '%s\n' "${raw}" | sed -n 's/^ups.status: //p' | head -n1)"
+
+    [[ -n "${status}" ]] || die "UPS nadal nie odpowiada. BYPASS pozostaje aktywny."
+    printf '%s\n' "${status}" | grep -qw OL || die "Nie kończę BYPASS bez stabilnego OL. Status: ${status}"
+    ! printf '%s\n' "${status}" | grep -qw OB || die "UPS raportuje OB. BYPASS pozostaje aktywny."
+
+    current_fp="$(powercycle_fingerprint "${raw}")"
+
+    # Power-cycle przywracamy tylko dla tego samego UPS i tylko po nowym probe.
+    if [[ "${PREV_POWERCYCLE}" == "1" ]]; then
+        if [[ -n "${BYPASS_UPS_FP:-}" && "${current_fp}" == "${BYPASS_UPS_FP}" ]]; then
+            if powercycle_probe 0; then
+                POWERCYCLE_ENABLED=1
+                if ! apply_current; then
+                    warn "Nie udało się ponownie aktywować power-cycle. Pozostaje WYŁĄCZONY."
+                    load_settings
+                    POWERCYCLE_ENABLED=0
+                    remove_powercycle_runtime
+                    apply_current || die "Nie udało się bezpiecznie utrwalić power-cycle=OFF. BYPASS pozostaje aktywny."
+                    powercycle_restored=0
+                fi
+            else
+                warn "UPS nie przeszedł ponownego capability probe. Power-cycle pozostaje WYŁĄCZONY."
+                POWERCYCLE_ENABLED=0
+                remove_powercycle_runtime
+                apply_current || die "Nie udało się bezpiecznie utrwalić power-cycle=OFF. BYPASS pozostaje aktywny."
+                powercycle_restored=0
+            fi
+        else
+            warn "Fingerprint UPS różni się od urządzenia sprzed BYPASS."
+            warn "Nie przywracam power-cycle automatycznie dla innego sprzętu."
+            POWERCYCLE_ENABLED=0
+            remove_powercycle_runtime
+            apply_current || die "Nie udało się bezpiecznie utrwalić power-cycle=OFF. BYPASS pozostaje aktywny."
+            powercycle_restored=0
+        fi
+    else
+        POWERCYCLE_ENABLED=0
+        remove_powercycle_runtime
+        apply_current || die "Nie udało się bezpiecznie utrwalić konfiguracji po BYPASS. BYPASS pozostaje aktywny."
+    fi
+
+    # Przywracamy stan usług sprzed BYPASS dopiero po stabilnym OL.
+    restore_service_state nut-monitor.service "${PREV_MONITOR_ACTIVE}" "${PREV_MONITOR_ENABLED}"
+
+    if [[ -f /etc/nut/nut-mqtt.json ]]; then
+        restore_service_state nut-mqtt.service "${PREV_MQTT_ACTIVE}" "${PREV_MQTT_ENABLED}"
+    else
+        systemctl disable --now nut-mqtt.service >/dev/null 2>&1 || true
+        [[ "${PREV_MQTT_ACTIVE}" == "0" ]] || warn "MQTT było wcześniej aktywne, ale brakuje /etc/nut/nut-mqtt.json."
+    fi
+
+    rm -f "${BYPASS_STATE}"
+
+    ok "Tryb BYPASS zakończony. UPS jest stabilnie OL."
+    echo "nut-monitor: $(systemctl is-active nut-monitor.service 2>/dev/null || true)"
+    echo "nut-mqtt:    $(systemctl is-active nut-mqtt.service 2>/dev/null || true)"
+    if [[ "${PREV_POWERCYCLE}" == "1" && "${powercycle_restored}" != "1" ]]; then
+        warn "Power-cycle NIE został automatycznie przywrócony. To celowe zabezpieczenie."
+        echo "Sprawdź ręcznie: nut-config powercycle probe"
+        echo "A potem ewentualnie: nut-config powercycle enable"
+    fi
+}
+
 help_text() {
     cat <<'EOF_HELP'
-Q-Tronic nut-config
+Q-Tronic nut-config — pomoc
 
-Podstawowe:
+NAJWAŻNIEJSZE ZASADY
+  - Normalny stan zasilania UPS: OL (On Line).
+  - OB oznacza pracę na baterii. Wtedy nie zmieniaj konfiguracji ani nie odłączaj USB.
+  - Jeśli chcesz fizycznie wyjąć UPS z układu, użyj BYPASS. Nie wyłączaj samego kabla USB "na żywo".
+  - Power-cycle jest domyślnie wyłączony i wymaga pozytywnego capability probe.
+  - Probe i powercycle enable NIE wysyłają testowego shutdown.return.
+
+SZYBKI START
+  nut-config
   nut-config show
-  nut-config menu
-  nut-config apply
-  nut-config help
+      Bez argumentu działa tak samo jak "nut-config show". Pokazuje całą bieżącą
+      konfigurację, stan usług, ups.status i stan BYPASS.
 
-Shutdown:
+  nut-config menu
+      Otwiera prowadzone menu z opisami i potwierdzeniami przy ryzykownych operacjach.
+
+  nut-config help
+      Wyświetla tę pomoc.
+
+  nut-config apply
+      Ponownie renderuje i stosuje zapisane ustawienia. Tworzy backup, wymaga bezpiecznego
+      stanu i po zmianie sprawdza stabilne OL. Przy błędzie wykonuje rollback.
+      Blokowane w BYPASS, bo planowo odłączony UPS nie powinien być restartowany/sondowany.
+
+SHUTDOWN
   nut-delay
+  nut-config delay
+      Pokazuje aktualny czas ciągłej pracy na baterii przed FSD/shutdownem.
+
   nut-delay 90
   nut-delay 2m
   nut-delay 1h
-  nut-config timed on|off
-  nut-config lowbatt on|off
+  nut-config delay 90
+      Ustawia opóźnienie shutdownu. Zakres: 15-86400 s. Zasilanie powracające przed
+      końcem timera anuluje shutdown.
 
-Home Assistant / NUT LAN:
-  nut-config listen auto
-  nut-config listen off
-  nut-config listen 192.168.1.10
-  nut-config port 3493
-  nut-config ha show
-  nut-config ha rotate
+  nut-config timed on
+      Włącza shutdown po upływie skonfigurowanego czasu ONBATT.
 
-Parametry NUT:
-  nut-config set POLLFREQ 5
-  nut-config set POLLFREQALERT 5
-  nut-config set HOSTSYNC 15
-  nut-config set DEADTIME 15
-  nut-config set FINALDELAY 5
-  nut-config set RBWARNTIME 43200
-  nut-config set NOCOMMWARNTIME 300
+  nut-config timed off
+      Wyłącza shutdown czasowy. LOWBATT może nadal wywołać natychmiastowy FSD.
 
-UPS / USB:
-  nut-config ups show
-  nut-config ups auto
-  nut-config usb 0764 0601
-  nut-config usb auto auto
-  nut-config set UPS_DESC "PowerWalker VI 2200 STL FR"
-  nut-config set UPS_DRIVER usbhid-ups
-  nut-config set UPS_PORT auto
-  nut-config set UPS_SUBDRIVER "CyberPower HID"
+  nut-config lowbatt on
+      Włącza natychmiastowy FSD po zdarzeniu LOWBATT. Zalecane ustawienie.
 
-Logi:
-  nut-config set LOG_ROTATE_SIZE 512k
-  nut-config set LOG_ROTATE_COUNT 6
-  nut-config logs 100
+  nut-config lowbatt off
+      Wyłącza reakcję shutdown na LOWBATT i pozostawia tylko logowanie. Używaj świadomie.
 
-MQTT:
-  nut-config mqtt setup
-  nut-config mqtt status
-  nut-config mqtt show
-  nut-config mqtt interval 15
-  nut-config mqtt disable
+BYPASS — BEZPIECZNE FIZYCZNE ODŁĄCZENIE UPS
+  nut-config bypass status
+      Pokazuje, czy tryb BYPASS jest aktywny i jaki był stan usług przed jego włączeniem.
 
-Hasła:
-  nut-config ha rotate
-  nut-config primary rotate
+  nut-config bypass enable
+  nut-config bypass enter
+  nut-config bypass on
+      Użyj PRZED odłączeniem UPS. Wymaga działającego UPS w stabilnym OL. Zapamiętuje
+      stan usług, zatrzymuje nut-monitor i MQTT, wyłącza power-cycle oraz usuwa jego
+      późny hook/flagę. Dopiero po komunikacie [OK] i statusie "Gotowy do odpięcia: TAK"
+      wolno odłączyć USB i przepiąć serwer.
 
-Monitor:
+  nut-config resume
+  nut-config bypass disable
+  nut-config bypass resume
+  nut-config bypass off
+      Użyj PO ponownym podłączeniu UPS. Restartuje stos NUT, wymaga stabilnego OL i
+      przywraca wcześniejszy stan monitora/MQTT. Power-cycle wraca automatycznie tylko
+      dla tego samego fingerprintu UPS i po świeżym pozytywnym probe. W przeciwnym
+      razie pozostaje bezpiecznie wyłączony.
+
+SZYBKA PROCEDURA: CHCĘ ODPIĄĆ UPS I ZASILAĆ SERWER Z GNIAZDKA
+  1) nut-status            -> upewnij się, że widzisz OL
+  2) nut-config bypass enable
+  3) nut-config bypass status -> musi być "Gotowy do odpięcia: TAK"
+  4) dopiero wtedy odłącz USB i przepnij zasilanie serwera
+
+  Gdy UPS wróci: podłącz zasilanie + USB, potem uruchom nut-config resume.
+
+MONITOR NUT
   nut-config monitor status
+      Pokazuje pełny status systemd nut-monitor.service.
+
   nut-config monitor enable
+  nut-config monitor on
+      Włącza ochronę hosta przez NUT. Komenda jest blokowana bez stabilnego OL oraz
+      podczas aktywnego BYPASS.
+
   nut-config monitor disable
+  nut-config monitor off
+      Wyłącza automatyczne reagowanie NUT na ONBATT/LOWBATT. Serwer przestaje być
+      automatycznie chroniony przed zanikiem zasilania.
 
-Power-cycle UPS:
+POWER-CYCLE UPS
   nut-config powercycle probe
+      Tylko odczyt. Sprawdza bieżący UPS, status OL, fingerprint, listę komend i m.in.
+      shutdown.return. Niczego nie odcina i nie wysyła shutdown.return.
+
   nut-config powercycle status
+      Pokazuje konfigurację power-cycle, obecność capability file, flagi FSD i hooka,
+      a następnie wykonuje bieżący read-only probe.
+
   nut-config powercycle delays 60 300
+      Ustawia OFF delay i ON delay w sekundach. OFF: 60-3600, ON: 120-86400, ON musi
+      być większe od OFF. Przy wyłączonym power-cycle tylko zapisuje wartości.
+
   nut-config powercycle enable
+      Włącza zabezpieczony mechanizm power-cycle. Wymaga stabilnego OL i jawnego
+      shutdown.return. Robi probe przed i po przeładowaniu konfiguracji. Nie wykonuje
+      fizycznego odcięcia podczas samego enable. Blokowane w BYPASS.
+
   nut-config powercycle disable
+      Wyłącza power-cycle, przywraca zwykły SHUTDOWNCMD i usuwa wrapper/hook/flagę.
+      Blokowane w BYPASS; do powrotu z BYPASS służy wyłącznie nut-config resume.
 
-Backup/diagnostyka:
+HOME ASSISTANT / NUT LAN
+  nut-config listen
+      Pokazuje bieżące ustawienie adresu LAN NUT.
+
+  nut-config listen auto
+      Automatycznie wybiera adres IPv4 hosta dla klientów LAN/Home Assistant.
+
+  nut-config listen off
+      Wyłącza dostęp NUT z LAN. Lokalny control-plane 127.0.0.1:3493 pozostaje aktywny.
+
+  nut-config listen 192.168.1.10
+      Ustawia konkretny lokalny adres IP, na którym NUT ma słuchać dla klientów LAN.
+
+  nut-config port
+      Pokazuje port LAN/Home Assistant.
+
+  nut-config port 3493
+      Ustawia port LAN/HA. Wewnętrzny localhost pozostaje zawsze na 3493.
+
+  nut-config ha show
+      Pokazuje host, port, użytkownika i HASŁO konta Home Assistant. Nie publikuj wyniku.
+
+  nut-config ha rotate
+      Generuje nowe losowe hasło dla Home Assistant, stosuje konfigurację i pokazuje
+      nowe dane logowania. Stare hasło przestaje działać.
+
+UPS / USB
+  nut-config ups show
+      Pokazuje logiczną nazwę UPS i aktualne ustawienia driver/port/VID/PID/subdriver.
+
+  nut-config ups auto
+      Skanuje USB przez nut-scanner i próbuje bezpiecznie dobrać parametry urządzenia.
+      Przy niejednoznacznym wyniku zatrzymuje się zamiast zgadywać.
+
+  nut-config usb 0764 0601
+      Ręcznie wiąże konfigurację z VID/PID. Używaj po sprawdzeniu lsusb/nut-scanner.
+
+  nut-config usb 0764 0601 "CyberPower HID"
+      Jak wyżej, ale dodatkowo ustawia subdriver.
+
+  nut-config usb auto auto
+      Usuwa ręczne ograniczenie VID/PID i wraca do automatycznego wyboru.
+
+MQTT
+  nut-config mqtt setup
+  nut-config mqtt config
+      Uruchamia konfigurator brokera, testuje połączenie i dopiero po udanym teście
+      włącza nut-mqtt.service. Blokowane podczas BYPASS.
+
+  nut-config mqtt status
+      Pokazuje pełny status usługi mostu MQTT.
+
+  nut-config mqtt show
+      Pokazuje zapisane ustawienia MQTT bez hasła.
+
+  nut-config mqtt interval 15
+      Ustawia interwał publikacji 5-3600 s. Restartuje usługę tylko wtedy, gdy już działa.
+
+  nut-config mqtt disable
+  nut-config mqtt off
+      Zatrzymuje i wyłącza usługę MQTT, ale zachowuje konfigurację do późniejszego użycia.
+
+HASŁA
+  nut-config primary rotate
+      Zmienia hasło lokalnego konta upsmon/proxmoxmon. Operacja robi backup, restart,
+      walidację OL i rollback przy błędzie.
+
+PARAMETRY ZAAWANSOWANE
+  nut-config get KLUCZ
+      Odczytuje pojedynczą dozwoloną wartość, np. nut-config get DEADTIME.
+
+  nut-config set KLUCZ WARTOŚĆ
+      Zmienia dozwolony parametr i stosuje konfigurację z backupem/walidacją.
+
+  Dozwolone przykłady:
+      nut-config set POLLFREQ 5
+      nut-config set POLLFREQALERT 5
+      nut-config set HOSTSYNC 15
+      nut-config set DEADTIME 15
+      nut-config set FINALDELAY 5
+      nut-config set RBWARNTIME 43200
+      nut-config set NOCOMMWARNTIME 300
+      nut-config set LOG_ROTATE_SIZE 512k
+      nut-config set LOG_ROTATE_COUNT 6
+      nut-config set UPS_DESC "PowerWalker VI 2200 STL FR"
+      nut-config set UPS_DRIVER usbhid-ups
+      nut-config set UPS_PORT auto
+      nut-config set UPS_SUBDRIVER "CyberPower HID"
+
+  Parametrów POWERCYCLE_* nie zmieniaj przez set — mają osobną bramkę bezpieczeństwa.
+
+BACKUP / ROLLBACK / DIAGNOSTYKA
   nut-config backup
-  nut-config rollback
-  nut-config report
-  nut-config capabilities
+      Tworzy natychmiastowy backup bieżącej konfiguracji i wypisuje jego katalog.
 
-Zasady bezpieczeństwa:
-- localhost:3493 pozostaje stałym wewnętrznym control-plane NUT.
-- Zmienny port dotyczy tylko dostępu LAN/Home Assistant.
-- Każda zmiana konfiguracji tworzy backup.
-- Gdy aktywny monitor widzi OB/brak odpowiedzi, zmiana jest blokowana.
-- Po zmianie wymagane jest stabilne OL; inaczej następuje rollback.
-- UPS_NAME jest celowo stałym identyfikatorem logicznym.
-- Fizyczne odcinanie 230 V nie jest włączane automatycznie.
-- "powercycle enable" wymaga jawnego shutdown.return z bieżącego sprzętu.
-- Przy prawdziwym FSD sprzęt jest sprawdzany ponownie przed uzbrojeniem hooka.
-- Probe i enable NIE wykonują testowego shutdown.return.
+  nut-config rollback
+      Przywraca ostatni backup utworzony przez nut-config i stan usług zapisany w backupie.
+
+  nut-config report
+      Pokazuje ustawienia Q-Tronic i uruchamia pełny nut-report. Raport może zawierać
+      IP, identyfikatory USB i numer seryjny UPS — przejrzyj przed publikacją.
+
+  nut-config capabilities
+      Uruchamia helper nut-capabilities i pokazuje dane/komendy/RW udostępniane przez UPS.
+
+  nut-config logs 100
+      Pokazuje ostatnie wpisy logów; liczba określa żądaną liczbę linii.
+
+ZASADY BEZPIECZEŃSTWA
+  - Nie odłączaj USB, gdy ups.status zawiera OB.
+  - Przed fizycznym usunięciem UPS użyj: nut-config bypass enable
+  - Po ponownym podłączeniu użyj: nut-config resume
+  - Nie uruchamiaj ręcznie shutdown.return, shutdown.stayoff ani load.off na działającym serwerze.
+  - localhost:3493 jest stałym wewnętrznym control-plane; zmienny port dotyczy LAN/HA.
+  - Zmiany konfiguracji są blokowane w niebezpiecznym stanie i walidowane po restarcie.
 EOF_HELP
+}
+
+menu_pause() {
+    echo
+    read -r -p "Naciśnij ENTER, aby wrócić do menu..." _ || true
+}
+
+menu_confirm_word() {
+    local word="$1" prompt="$2" answer
+    echo
+    echo "UWAGA: ${prompt}"
+    read -r -p "Aby potwierdzić wpisz dokładnie ${word}: " answer
+    [[ "${answer}" == "${word}" ]]
+}
+
+menu_header() {
+    load_settings
+    local status bypass
+    status="$(status_now || true)"
+    bypass="$([[ -f "${BYPASS_STATE}" ]] && echo TAK || echo NIE)"
+
+    clear 2>/dev/null || true
+    echo "============================================================"
+    echo " Q-Tronic NUT — bezpieczna konfiguracja"
+    echo "============================================================"
+    echo "UPS status:      ${status:-brak komunikacji}"
+    echo "nut-monitor:     $(systemctl is-active nut-monitor.service 2>/dev/null || true)"
+    echo "Power-cycle:     $([[ "${POWERCYCLE_ENABLED}" == "1" ]] && echo WŁĄCZONY || echo wyłączony)"
+    echo "BYPASS:          ${bypass}"
+    echo "Shutdown timer:  $([[ "${TIMED_SHUTDOWN}" == "1" ]] && echo "ON (${SHUTDOWN_DELAY}s)" || echo OFF)"
+    echo "LOWBATT:         $([[ "${LOWBATT_SHUTDOWN}" == "1" ]] && echo shutdown || echo tylko-log)"
+    echo "============================================================"
+    if [[ -z "${status}" ]]; then
+        echo "!!! BRAK KOMUNIKACJI Z UPS — nie zmieniaj konfiguracji ani okablowania w ciemno."
+    elif printf '%s\n' "${status}" | grep -qw OB; then
+        echo "!!! UPS PRACUJE Z BATERII (OB) — nie odłączaj USB i nie zmieniaj konfiguracji."
+    elif printf '%s\n' "${status}" | grep -qw OL; then
+        echo "Stan UPS: OL — normalne zasilanie sieciowe."
+    else
+        echo "UWAGA: nietypowy status UPS: ${status}. Przed zmianami sprawdź nut-status."
+    fi
+    echo "============================================================"
+}
+
+menu_shutdown() {
+    while true; do
+        load_settings
+        echo
+        echo "--- Shutdown ---"
+        echo "Aktualnie: timer=$([[ "${TIMED_SHUTDOWN}" == "1" ]] && echo ON || echo OFF), delay=${SHUTDOWN_DELAY}s, LOWBATT=$([[ "${LOWBATT_SHUTDOWN}" == "1" ]] && echo ON || echo OFF)"
+        echo "1) Zmień czas do shutdownu"
+        echo "2) Włącz shutdown czasowy"
+        echo "3) Wyłącz shutdown czasowy"
+        echo "4) Włącz natychmiastowy shutdown LOWBATT (zalecane)"
+        echo "5) Wyłącz shutdown LOWBATT (zmniejsza ochronę)"
+        echo "0) Wróć"
+        read -r -p "Wybór: " v
+        case "${v}" in
+            1) read -r -p "Nowy czas, np. 90 / 2m / 1h: " d; set_key SHUTDOWN_DELAY "${d}"; menu_pause ;;
+            2) set_key TIMED_SHUTDOWN on; menu_pause ;;
+            3) if menu_confirm_word WYLACZ "Serwer NIE wyłączy się po samym upływie czasu ONBATT."; then set_key TIMED_SHUTDOWN off; else echo "Anulowano."; fi; menu_pause ;;
+            4) set_key LOWBATT_SHUTDOWN on; menu_pause ;;
+            5) if menu_confirm_word WYLACZ "LOWBATT przestanie wymuszać awaryjny shutdown."; then set_key LOWBATT_SHUTDOWN off; else echo "Anulowano."; fi; menu_pause ;;
+            0) return ;;
+            *) echo "Nieprawidłowy wybór."; menu_pause ;;
+        esac
+    done
+}
+
+menu_bypass() {
+    while true; do
+        echo
+        echo "--- BYPASS / praca bez UPS ---"
+        echo "1) Pokaż status BYPASS"
+        echo "2) Włącz BYPASS przed fizycznym odłączeniem UPS"
+        echo "3) Zakończ BYPASS po ponownym podłączeniu UPS"
+        echo "0) Wróć"
+        read -r -p "Wybór: " v
+        case "${v}" in
+            1) bypass_status; menu_pause ;;
+            2)
+                echo "BYPASS zatrzyma nut-monitor i MQTT oraz wyłączy power-cycle."
+                echo "UPS MUSI być teraz podłączony i raportować stabilne OL."
+                if menu_confirm_word BYPASS "Po komunikacie [OK] możesz fizycznie usunąć UPS z toru zasilania."; then bypass_enable; else echo "Anulowano."; fi
+                menu_pause
+                ;;
+            3)
+                echo "Najpierw podłącz UPS do sieci, podłącz USB i upewnij się, że urządzenie jest gotowe."
+                if menu_confirm_word PRZYWROC "Resume uruchomi ponownie stos NUT i może przywrócić monitor/MQTT oraz zweryfikowany power-cycle."; then bypass_resume; else echo "Anulowano."; fi
+                menu_pause
+                ;;
+            0) return ;;
+            *) echo "Nieprawidłowy wybór."; menu_pause ;;
+        esac
+    done
+}
+
+menu_powercycle() {
+    while true; do
+        load_settings
+        echo
+        echo "--- Power-cycle UPS ---"
+        echo "Aktualnie: $([[ "${POWERCYCLE_ENABLED}" == "1" ]] && echo WŁĄCZONY || echo wyłączony), OFF=${POWERCYCLE_OFFDELAY}s, ON=${POWERCYCLE_ONDELAY}s"
+        echo "1) [ODCZYT] Probe możliwości UPS — niczego nie wyłącza"
+        echo "2) [ODCZYT] Pełny status power-cycle"
+        echo "3) [ZMIANA] Zmień OFF/ON delay"
+        echo "4) [UZBROJENIE] Włącz power-cycle — bez fizycznego testu w tej chwili"
+        echo "5) [ZMIANA] Wyłącz power-cycle"
+        echo "0) Wróć"
+        read -r -p "Wybór: " v
+        case "${v}" in
+            1) powercycle_probe 0 || true; menu_pause ;;
+            2) powercycle_status; menu_pause ;;
+            3) read -r -p "OFF delay [60-3600 s]: " d1; read -r -p "ON delay [120-86400 s, > OFF]: " d2; powercycle_delays "${d1}" "${d2}"; menu_pause ;;
+            4)
+                echo "Enable sam NIE wyśle shutdown.return, ale uzbroi mechanizm na przyszły prawdziwy FSD."
+                if menu_confirm_word WLACZ "Włączaj dopiero po pozytywnym probe i kontrolowanym planie testu."; then powercycle_enable; else echo "Anulowano."; fi
+                menu_pause
+                ;;
+            5) powercycle_disable; menu_pause ;;
+            0) return ;;
+            *) echo "Nieprawidłowy wybór."; menu_pause ;;
+        esac
+    done
 }
 
 menu() {
     while true; do
-        echo
-        echo "Q-Tronic NUT - konfiguracja"
-        echo "1) Pokaż ustawienia"
-        echo "2) Shutdown delay"
-        echo "3) Timed shutdown ON/OFF"
-        echo "4) LOWBATT shutdown ON/OFF"
-        echo "5) NUT LAN IP"
-        echo "6) NUT LAN port"
-        echo "7) Auto-detect UPS USB"
-        echo "8) Home Assistant"
-        echo "9) MQTT"
-        echo "10) Monitor NUT"
-        echo "11) Power-cycle UPS"
-        echo "12) Raport"
-        echo "0) Wyjście"
+        menu_header
+
+        if bypass_active; then
+            echo "BYPASS jest aktywny — menu ogranicza zmiany do bezpiecznych operacji."
+            echo "1) Pokaż status BYPASS"
+            echo "2) Zakończ BYPASS po ponownym podłączeniu UPS"
+            echo "3) Pokaż ogólny status/ustawienia"
+            echo "4) Pokaż ostatnie 100 linii logów"
+            echo "0) Wyjście"
+            read -r -p "Wybór: " choice
+            case "${choice}" in
+                1) bypass_status; menu_pause ;;
+                2)
+                    if menu_confirm_word PRZYWROC "UPS musi być ponownie podłączony; resume wymaga stabilnego OL i przywraca zapamiętane usługi."; then bypass_resume; else echo "Anulowano."; fi
+                    menu_pause
+                    ;;
+                3) show; menu_pause ;;
+                4) /usr/local/sbin/nut-logs 100; menu_pause ;;
+                0) exit 0 ;;
+                *) echo "Nieprawidłowy wybór."; menu_pause ;;
+            esac
+            continue
+        fi
+
+        echo "1)  [ODCZYT] Status i wszystkie ustawienia"
+        echo "2)  [OCHRONA] Shutdown: timer / delay / LOWBATT"
+        echo "3)  [SPRZĘT] UPS / USB: podgląd lub auto-detect"
+        echo "4)  [SIEĆ] LAN / Home Assistant"
+        echo "5)  [OCHRONA] Monitor NUT"
+        echo "6)  [PROCEDURA] BYPASS — bezpieczne odłączenie/powrót UPS"
+        echo "7)  [ZAAWANSOWANE] Power-cycle UPS"
+        echo "8)  [OPCJONALNE] MQTT"
+        echo "9)  [ODCZYT] Diagnostyka / logi / test guide"
+        echo "10) [ODZYSKIWANIE] Backup / rollback"
+        echo "11) [POMOC] Opis wszystkich komend"
+        echo "0)  Wyjście"
         read -r -p "Wybór: " choice
 
         case "${choice}" in
-            1) show ;;
-            2) read -r -p "Czas (90 / 2m / 1h): " v; set_key SHUTDOWN_DELAY "${v}" ;;
-            3) read -r -p "on/off: " v; set_key TIMED_SHUTDOWN "${v}" ;;
-            4) read -r -p "on/off: " v; set_key LOWBATT_SHUTDOWN "${v}" ;;
-            5) read -r -p "auto / off / IP: " v; set_key NUT_LISTEN_IP "${v}" ;;
-            6) read -r -p "Port: " v; set_key NUT_PORT "${v}" ;;
-            7) detect_ups ;;
-            8) /usr/local/sbin/nut-ha-info ;;
-            9) /usr/local/sbin/nut-mqtt-config ;;
-            10) read -r -p "status/enable/disable: " v; monitor_cmd "${v}" ;;
-            11)
-                echo "a) probe"
-                echo "b) status"
-                echo "c) delays"
-                echo "d) enable"
-                echo "e) disable"
+            1) show; menu_pause ;;
+            2) menu_shutdown ;;
+            3)
+                echo
+                echo "1) Pokaż ustawienia UPS/USB"
+                echo "2) Auto-detect przez nut-scanner"
+                echo "0) Anuluj"
                 read -r -p "Wybór: " v
                 case "${v}" in
-                    a) powercycle_probe 0 ;;
-                    b) powercycle_status ;;
-                    c)
-                        read -r -p "OFF delay [s]: " d1
-                        read -r -p "ON delay [s]: " d2
-                        powercycle_delays "${d1}" "${d2}"
+                    1) echo "UPS_NAME=${UPS_NAME}"; echo "UPS_DRIVER=${UPS_DRIVER}"; echo "UPS_PORT=${UPS_PORT}"; echo "UPS_VENDORID=${UPS_VENDORID}"; echo "UPS_PRODUCTID=${UPS_PRODUCTID}"; echo "UPS_SUBDRIVER=${UPS_SUBDRIVER}" ;;
+                    2)
+                        echo "Auto-detect może zmienić driver/VID/PID/subdriver i zrestartować NUT."
+                        if menu_confirm_word WYKRYJ "Uruchom auto-detect tylko przy stabilnym OL i podłączonym właściwym UPS."; then detect_ups; else echo "Anulowano."; fi
                         ;;
-                    d) powercycle_enable ;;
-                    e) powercycle_disable ;;
+                    0) : ;;
+                    *) echo "Nieprawidłowy wybór." ;;
                 esac
+                menu_pause
                 ;;
-            12) /usr/local/sbin/nut-report ;;
+            4)
+                echo
+                echo "1) Pokaż dane Home Assistant (UWAGA: pokazuje hasło)"
+                echo "2) LAN auto"
+                echo "3) Wyłącz LAN"
+                echo "4) Ustaw konkretny IP LAN"
+                echo "5) Ustaw port LAN/HA"
+                echo "0) Anuluj"
+                read -r -p "Wybór: " v
+                case "${v}" in
+                    1)
+                        if menu_confirm_word POKAZ "Na ekranie zostanie wyświetlone HASŁO konta Home Assistant."; then /usr/local/sbin/nut-ha-info; else echo "Anulowano."; fi
+                        ;;
+                    2) set_key NUT_LISTEN_IP auto ;;
+                    3) set_key NUT_LISTEN_IP off ;;
+                    4) read -r -p "Adres IPv4/IPv6 hosta: " ip; set_key NUT_LISTEN_IP "${ip}" ;;
+                    5) read -r -p "Port [1-65535]: " port; set_key NUT_PORT "${port}" ;;
+                    0) : ;;
+                    *) echo "Nieprawidłowy wybór." ;;
+                esac
+                menu_pause
+                ;;
+            5)
+                echo
+                echo "1) Status monitora"
+                echo "2) Włącz monitor (wymaga OL)"
+                echo "3) Wyłącz monitor (wyłącza automatyczną ochronę)"
+                echo "0) Anuluj"
+                read -r -p "Wybór: " v
+                case "${v}" in
+                    1) monitor_cmd status ;;
+                    2) monitor_cmd enable ;;
+                    3) if menu_confirm_word WYLACZ "Po wyłączeniu nut-monitor host nie reaguje automatycznie na awarię zasilania."; then monitor_cmd disable; else echo "Anulowano."; fi ;;
+                    0) : ;;
+                    *) echo "Nieprawidłowy wybór." ;;
+                esac
+                menu_pause
+                ;;
+            6) menu_bypass ;;
+            7) menu_powercycle ;;
+            8)
+                echo
+                echo "1) Status MQTT"
+                echo "2) Konfiguruj/testuj MQTT"
+                echo "3) Pokaż konfigurację bez hasła"
+                echo "4) Zmień interwał publikacji"
+                echo "5) Wyłącz MQTT"
+                echo "0) Anuluj"
+                read -r -p "Wybór: " v
+                case "${v}" in
+                    1) mqtt_cmd status ;;
+                    2) mqtt_cmd setup ;;
+                    3) mqtt_cmd show ;;
+                    4) read -r -p "Interwał [5-3600 s]: " sec; mqtt_cmd interval "${sec}" ;;
+                    5) mqtt_cmd disable ;;
+                    0) : ;;
+                    *) echo "Nieprawidłowy wybór." ;;
+                esac
+                menu_pause
+                ;;
+            9)
+                echo
+                echo "1) nut-status — szybki stan UPS"
+                echo "2) capabilities — dane/komendy/RW urządzenia"
+                echo "3) ostatnie 100 linii logów"
+                echo "4) pełny raport diagnostyczny"
+                echo "5) bezpieczna instrukcja pierwszego testu"
+                echo "0) Anuluj"
+                read -r -p "Wybór: " v
+                case "${v}" in
+                    1) /usr/local/sbin/nut-status ;;
+                    2) /usr/local/sbin/nut-capabilities ;;
+                    3) /usr/local/sbin/nut-logs 100 ;;
+                    4) /usr/local/sbin/nut-report ;;
+                    5) /usr/local/sbin/nut-test-guide ;;
+                    0) : ;;
+                    *) echo "Nieprawidłowy wybór." ;;
+                esac
+                menu_pause
+                ;;
+            10)
+                echo
+                echo "1) Utwórz backup teraz"
+                echo "2) Rollback ostatniej zmiany nut-config"
+                echo "0) Anuluj"
+                read -r -p "Wybór: " v
+                case "${v}" in
+                    1) backup_now ;;
+                    2) if menu_confirm_word PRZYWROC "Rollback zastąpi bieżące pliki NUT ostatnim backupem."; then require_normal_mode; [[ -f "${BASE}/LAST_CONFIG_BACKUP" ]] || die "Brak LAST_CONFIG_BACKUP."; restore_backup_dir "$(cat "${BASE}/LAST_CONFIG_BACKUP")"; else echo "Anulowano."; fi ;;
+                    0) : ;;
+                    *) echo "Nieprawidłowy wybór." ;;
+                esac
+                menu_pause
+                ;;
+            11) help_text; menu_pause ;;
             0) exit 0 ;;
+            *) echo "Nieprawidłowy wybór."; menu_pause ;;
         esac
     done
 }
@@ -1765,6 +2420,7 @@ case "${cmd}" in
         help_text
         ;;
     apply)
+        require_normal_mode
         load_creds
         apply_current
         ;;
@@ -1867,6 +2523,26 @@ case "${cmd}" in
     mqtt)
         mqtt_cmd "$@"
         ;;
+    bypass)
+        sub="${1:-status}"
+        case "${sub}" in
+            status)
+                bypass_status
+                ;;
+            enable|enter|on)
+                bypass_enable
+                ;;
+            disable|resume|off)
+                bypass_resume
+                ;;
+            *)
+                die "nut-config bypass status|enable|disable"
+                ;;
+        esac
+        ;;
+    resume)
+        bypass_resume
+        ;;
     monitor)
         monitor_cmd "${1:-status}"
         ;;
@@ -1874,6 +2550,7 @@ case "${cmd}" in
         echo "$(backup_now)"
         ;;
     rollback)
+        require_normal_mode
         [[ -f "${BASE}/LAST_CONFIG_BACKUP" ]] || die "Brak LAST_CONFIG_BACKUP."
         restore_backup_dir "$(cat "${BASE}/LAST_CONFIG_BACKUP")"
         ;;

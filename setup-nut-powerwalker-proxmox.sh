@@ -81,6 +81,10 @@ die()  { printf "\n${C_RED}[BŁĄD]${C_RESET} %s\n" "$*" >&2; exit 1; }
 
 [[ "${EUID}" -eq 0 ]] || die "Uruchom skrypt jako root."
 
+if [[ -f /etc/nut/qtronic-bypass-state.env ]]; then
+    die "Tryb BYPASS jest aktywny. Nie aktualizuję/reinstaluję NUT podczas celowo odłączonego UPS. Najpierw podłącz UPS i uruchom: nut-config resume"
+fi
+
 case "${SHUTDOWN_DELAY}" in
   ''|*[!0-9]*) die "SHUTDOWN_DELAY musi być liczbą całkowitą sekund." ;;
 esac
@@ -403,19 +407,30 @@ info "Detekcja: ${DETECTION_REASON}"
 # IP hosta
 # ------------------------------------------------------------------------------
 
-if [[ -n "${NUT_LISTEN_IP}" ]]; then
-    PVE_IP="${NUT_LISTEN_IP}"
-else
-    PVE_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
-    if [[ -z "${PVE_IP}" ]]; then
-        PVE_IP="$(ip -o -4 addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}' || true)"
-    fi
-fi
+case "${NUT_LISTEN_IP,,}" in
+    off|none|disable)
+        PVE_IP=""
+        info "Dostęp NUT z LAN został jawnie wyłączony (NUT_LISTEN_IP=${NUT_LISTEN_IP})."
+        ;;
+    ""|auto)
+        PVE_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+        if [[ -z "${PVE_IP}" ]]; then
+            PVE_IP="$(ip -o -4 addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}' || true)"
+        fi
+        ;;
+    *)
+        PVE_IP="${NUT_LISTEN_IP}"
+        python3 - "${PVE_IP}" <<'PY_IP'
+import ipaddress, sys
+ipaddress.ip_address(sys.argv[1])
+PY_IP
+        ;;
+esac
 
 if [[ -n "${PVE_IP}" ]]; then
     ok "Adres LAN Proxmoxa dla NUT: ${PVE_IP}"
 else
-    warn "Nie udało się ustalić IPv4 Proxmoxa. NUT będzie dostępny tylko lokalnie."
+    warn "NUT nie będzie wystawiony do LAN; lokalny control-plane pozostaje na 127.0.0.1:3493."
 fi
 
 # ------------------------------------------------------------------------------
@@ -461,13 +476,16 @@ EOF
 if [[ -n "${PVE_IP}" && "${PVE_IP}" != "127.0.0.1" ]]; then
     atomic_install /etc/nut/upsd.conf root nut 0640 <<EOF
 ${MARKER}
-LISTEN 127.0.0.1 ${NUT_PORT}
+# Stały lokalny control-plane NUT dla upsmon/narzędzi na hoście:
+LISTEN 127.0.0.1 3493
+# Port konfigurowalny dotyczy klientów LAN / Home Assistant:
 LISTEN ${PVE_IP} ${NUT_PORT}
 EOF
 else
     atomic_install /etc/nut/upsd.conf root nut 0640 <<EOF
 ${MARKER}
-LISTEN 127.0.0.1 ${NUT_PORT}
+# Stały lokalny control-plane NUT:
+LISTEN 127.0.0.1 3493
 EOF
 fi
 
@@ -1066,8 +1084,24 @@ set -u
 UPS="${UPS_NAME}@localhost"
 
 if ! RAW="\$(${UPSC_BIN} "\${UPS}" 2>&1)"; then
+    if [[ -f /etc/nut/qtronic-bypass-state.env ]]; then
+        echo "============================================================"
+        echo " Q-Tronic | NUT / PowerWalker"
+        echo "============================================================"
+        echo "BYPASS:          AKTYWNY"
+        echo "UPS:             celowo może być fizycznie odłączony"
+        echo "Komunikacja:     brak (oczekiwane w BYPASS po odpięciu UPS)"
+        echo "nut-monitor:     \$(systemctl is-active nut-monitor.service 2>/dev/null || true)"
+        echo "nut-server:      \$(systemctl is-active nut-server.service 2>/dev/null || true)"
+        echo "nut-mqtt:        \$(systemctl is-active nut-mqtt.service 2>/dev/null || true)"
+        echo "------------------------------------------------------------"
+        echo "Po ponownym podłączeniu UPS uruchom: nut-config resume"
+        echo "============================================================"
+        exit 0
+    fi
     echo "BŁĄD: brak komunikacji z \${UPS}"
     echo "\${RAW}"
+    echo "Jeśli UPS został odłączony celowo, użyj wcześniej: nut-config bypass enable"
     exit 1
 fi
 
@@ -1098,6 +1132,7 @@ echo "Moc:             \${REALPOWER:-brak} W"
 echo "Moc znamionowa:  \${NOMINAL:-brak} W"
 echo "Napięcie wej.:   \${INPUT:-brak} V"
 echo "Napięcie wyj.:   \${OUTPUT:-brak} V"
+echo "BYPASS:          \$([[ -f /etc/nut/qtronic-bypass-state.env ]] && echo AKTYWNY || echo nie)"
 echo "------------------------------------------------------------"
 echo "nut-monitor:     \$(systemctl is-active nut-monitor.service 2>/dev/null || true)"
 echo "nut-server:      \$(systemctl is-active nut-server.service 2>/dev/null || true)"
@@ -1193,6 +1228,9 @@ cat <<'TXT'
  Autor konfiguracji: Q-Tronic
 ============================================================
 
+0. Sprawdź, że power-cycle jest WYŁĄCZONY:
+   nut-config powercycle status
+
 1. W pierwszym SSH:
    nut-watch
 
@@ -1224,6 +1262,12 @@ NIE URUCHAMIAJ bez osobnej weryfikacji:
    load.off.delay
 
 Te komendy mogą naprawdę zatrzymać host lub odciąć wyjście UPS.
+
+Jeśli chcesz celowo wyjąć UPS z układu i zasilać serwer bezpośrednio
+z sieci, NIE odłączaj po prostu USB. Użyj:
+   nut-config bypass enable
+A po ponownym podłączeniu:
+   nut-config resume
 ============================================================
 TXT
 EOF
@@ -1231,6 +1275,12 @@ EOF
 atomic_install "${LIB_DIR}/nut-restart.sh" root root 0755 <<EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
+
+if [[ -f /etc/nut/qtronic-bypass-state.env ]]; then
+    echo "BYPASS jest aktywny. Nie uzbrajam monitora przez nut-restart." >&2
+    echo "Po ponownym podłączeniu UPS użyj: nut-config resume" >&2
+    exit 20
+fi
 
 ${LIB_DIR}/restart-stack.sh
 
@@ -1399,6 +1449,12 @@ atomic_install "${LIB_DIR}/nut-mqtt-config.sh" root root 0755 <<EOF
 set -Eeuo pipefail
 umask 077
 
+if [[ -f /etc/nut/qtronic-bypass-state.env ]]; then
+    echo "BYPASS jest aktywny. Nie włączam MQTT bez aktywnego UPS." >&2
+    echo "Po ponownym podłączeniu UPS użyj: nut-config resume" >&2
+    exit 20
+fi
+
 CFG="/etc/nut/nut-mqtt.json"
 HOSTNAME_ID="\$(hostname -s | tr -cd '[:alnum:]_-' | tr '[:upper:]' '[:lower:]')"
 DEVICE_ID="qtronic_\${HOSTNAME_ID}_${UPS_NAME}"
@@ -1498,6 +1554,12 @@ EOF
 atomic_install "${LIB_DIR}/rollback-last-backup.sh" root root 0755 <<EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
+
+if [[ -f /etc/nut/qtronic-bypass-state.env ]]; then
+    echo "BYPASS jest aktywny. Nie wykonuję pełnego rollbacku instalatora w tym trybie." >&2
+    echo "Najpierw podłącz UPS i uruchom: nut-config resume" >&2
+    exit 20
+fi
 
 BASE="${BASE_DIR}"
 BACKUP="\$(cat "\${BASE}/LAST_BACKUP")"
@@ -1666,6 +1728,13 @@ Bezpieczna instrukcja testu:
 
 Restart/ponowna walidacja NUT po podłączeniu UPS:
   nut-restart
+
+Planowane fizyczne odłączenie UPS:
+  nut-config bypass enable
+  nut-config bypass status
+
+Powrót po ponownym podłączeniu UPS:
+  nut-config resume
 
 Pełny raport diagnostyczny:
   nut-report
