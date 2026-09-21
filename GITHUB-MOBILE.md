@@ -149,6 +149,27 @@ Ponowne wykrycie UPS po USB:
 nut-config ups auto
 ```
 
+Power-cycle UPS najpierw tylko sprawdź:
+
+```bash
+nut-config powercycle probe
+```
+
+Jeżeli wynik pozwoli na aktywację:
+
+```bash
+nut-config powercycle delays 60 300
+nut-config powercycle enable
+```
+
+Wyłączenie:
+
+```bash
+nut-config powercycle disable
+```
+
+`probe` i `enable` nie wykonują testowego odcięcia zasilania. Przy prawdziwym FSD sprzęt jest sprawdzany ponownie.
+
 Pełna pomoc:
 
 ```bash

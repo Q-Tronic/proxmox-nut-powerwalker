@@ -23,19 +23,9 @@ Projekt został przygotowany przede wszystkim pod **PowerWalker VI 2200 STL FR**
 - prowadzi niewielkie, rotowane logi zdarzeń,
 - może publikować telemetrię do MQTT przez Home Assistant MQTT Discovery.
 
-## Czego instalator celowo nie robi
+## Ochrona przed przypadkowym odcięciem
 
-Nie wykonuje i nie konfiguruje automatycznie:
-
-```text
-shutdown.return
-shutdown.stayoff
-load.off
-load.off.delay
-POWERDOWNFLAG
-```
-
-To są funkcje mogące fizycznie odciąć wyjście UPS. Zostaną dopiero osobno zweryfikowane na konkretnej sztuce UPS.
+Instalator nigdy nie aktywuje power-cycle sam z siebie. Funkcja pozostaje `OFF`, dopóki `nut-config powercycle probe` nie potwierdzi obsługi na konkretnej sztuce i użytkownik nie wykona `nut-config powercycle enable`.
 
 ## Instalacja na Proxmoxie
 
@@ -220,7 +210,40 @@ Każda normalna zmiana konfiguracji tworzy backup. Jeśli aktywny `nut-monitor` 
 
 `UPS_NAME` pozostaje stałym identyfikatorem logicznym. To celowe: zapobiega rozjechaniu odwołań pomiędzy NUT, MQTT i Home Assistantem. Opis urządzenia, sterownik, port urządzenia, VID/PID, subdriver, polityka shutdownu, sieć, timingi, logowanie, MQTT i hasła można zmieniać po instalacji.
 
-Funkcje fizycznego odcinania wyjścia UPS (`shutdown.return`, `load.off` itd.) pozostają oddzielnie zablokowane, dopóki konkretna sztuka UPS nie potwierdzi ich obsługi.
+Power-cycle UPS jest domyślnie **wyłączony** i ma osobną bramkę sprzętową.
+
+Najpierw:
+
+```bash
+nut-config powercycle probe
+```
+
+`probe` tylko odczytuje możliwości bieżącego UPS-a. Wymagana jest jawna obsługa `shutdown.return`; sprawdzane są też sterownik, fingerprint urządzenia, delaye i obecność `upsdrvctl`.
+
+Dopiero po pozytywnym wyniku:
+
+```bash
+nut-config powercycle enable
+```
+
+`enable` ponownie wykonuje probe. Podczas konfiguracji **nie jest wykonywany testowy `shutdown.return`**, bo taki test może faktycznie odciąć zasilanie.
+
+Przykładowe delaye:
+
+```bash
+nut-config powercycle delays 60 300
+```
+
+Dla `usbhid-ups` są zapisywane jako `offdelay` i `ondelay`. Konfigurator wymusza minimum 60 s dla OFF, 120 s dla ON oraz `ON > OFF`.
+
+Status/wyłączenie:
+
+```bash
+nut-config powercycle status
+nut-config powercycle disable
+```
+
+Przy prawdziwym FSD `SHUTDOWNCMD` uruchamia dodatkowy wrapper. Wrapper ponownie porównuje fingerprint aktualnego urządzenia z tym zapamiętanym podczas probe i jeszcze raz sprawdza `shutdown.return`. Dopiero wtedy uzbraja późny hook `systemd-shutdown`, który wykonuje `upsdrvctl shutdown` po zakończeniu normalnej sekwencji zamykania systemu.
 
 ## Najważniejsze komendy po instalacji
 

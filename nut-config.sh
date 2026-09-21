@@ -157,6 +157,12 @@ derive_settings_from_current() {
 
     LOG_ROTATE_COUNT="$(awk '$1=="rotate" {print $2; exit}' "${LOGROTATE}" 2>/dev/null || true)"
     LOG_ROTATE_COUNT="${LOG_ROTATE_COUNT:-6}"
+
+    # Nigdy nie aktywujemy power-cycle tylko dlatego, że coś podobnego
+    # znajdowało się wcześniej w konfiguracji. Wymagany jest capability probe.
+    POWERCYCLE_ENABLED=0
+    POWERCYCLE_OFFDELAY=60
+    POWERCYCLE_ONDELAY=300
 }
 
 load_settings() {
@@ -190,6 +196,10 @@ load_settings() {
     LOG_ROTATE_SIZE="${LOG_ROTATE_SIZE:-512k}"
     LOG_ROTATE_COUNT="${LOG_ROTATE_COUNT:-6}"
     UPSMON_ROLE="${UPSMON_ROLE:-primary}"
+
+    POWERCYCLE_ENABLED="${POWERCYCLE_ENABLED:-0}"
+    POWERCYCLE_OFFDELAY="${POWERCYCLE_OFFDELAY:-60}"
+    POWERCYCLE_ONDELAY="${POWERCYCLE_ONDELAY:-300}"
 }
 
 load_creds() {
@@ -233,6 +243,13 @@ validate_settings() {
     is_log_size "${LOG_ROTATE_SIZE}" || die "LOG_ROTATE_SIZE np. 512k, 2M."
     is_uint "${LOG_ROTATE_COUNT}" || die "LOG_ROTATE_COUNT nie jest liczbą."
     (( LOG_ROTATE_COUNT >= 1 && LOG_ROTATE_COUNT <= 50 )) || die "LOG_ROTATE_COUNT: 1-50."
+
+    is_bool "${POWERCYCLE_ENABLED}" || die "POWERCYCLE_ENABLED: 0/1."
+    is_uint "${POWERCYCLE_OFFDELAY}" || die "POWERCYCLE_OFFDELAY nie jest liczbą."
+    is_uint "${POWERCYCLE_ONDELAY}" || die "POWERCYCLE_ONDELAY nie jest liczbą."
+    (( POWERCYCLE_OFFDELAY >= 60 && POWERCYCLE_OFFDELAY <= 3600 ))         || die "POWERCYCLE_OFFDELAY: 60-3600 s."
+    (( POWERCYCLE_ONDELAY >= 120 && POWERCYCLE_ONDELAY <= 86400 ))         || die "POWERCYCLE_ONDELAY: 120-86400 s."
+    (( POWERCYCLE_ONDELAY > POWERCYCLE_OFFDELAY ))         || die "POWERCYCLE_ONDELAY musi być większy od POWERCYCLE_OFFDELAY."
 
     if [[ "${NUT_LISTEN_IP}" != "auto" && "${NUT_LISTEN_IP}" != "off" ]]; then
         python3 - "${NUT_LISTEN_IP}" <<'PY'
@@ -297,6 +314,9 @@ save_settings_to() {
         printf 'LOG_ROTATE_SIZE=%q\n' "${LOG_ROTATE_SIZE}"
         printf 'LOG_ROTATE_COUNT=%q\n' "${LOG_ROTATE_COUNT}"
         printf 'UPSMON_ROLE=%q\n' "${UPSMON_ROLE}"
+        printf 'POWERCYCLE_ENABLED=%q\n' "${POWERCYCLE_ENABLED}"
+        printf 'POWERCYCLE_OFFDELAY=%q\n' "${POWERCYCLE_OFFDELAY}"
+        printf 'POWERCYCLE_ONDELAY=%q\n' "${POWERCYCLE_ONDELAY}"
     } > "${dst}"
 }
 
@@ -335,7 +355,8 @@ backup_now() {
         /etc/nut/upssched.conf \
         "${LOGROTATE}" \
         "${CREDS}" \
-        /etc/nut/nut-mqtt.json; do
+        /etc/nut/nut-mqtt.json \
+        /etc/nut/qtronic-powercycle-capability.json; do
         if [[ -e "${f}" ]]; then
             cp -a "${f}" "${d}/$(echo "${f}" | sed 's#^/##; s#/#__#g')"
         fi
@@ -422,6 +443,13 @@ render_temp() {
         [[ -n "${UPS_VENDORID}" ]] && echo "    vendorid = ${UPS_VENDORID}"
         [[ -n "${UPS_PRODUCTID}" ]] && echo "    productid = ${UPS_PRODUCTID}"
         [[ -n "${UPS_SUBDRIVER}" ]] && echo "    subdriver = \"${UPS_SUBDRIVER//\"/}\""
+
+        # offdelay/ondelay są parametrami usbhid-ups. Nigdy nie dodajemy
+        # ich przed pozytywnym capability probe konkretnego UPS-a.
+        if [[ "${POWERCYCLE_ENABLED}" == "1" && "${UPS_DRIVER}" == "usbhid-ups" ]]; then
+            echo "    offdelay = ${POWERCYCLE_OFFDELAY}"
+            echo "    ondelay = ${POWERCYCLE_ONDELAY}"
+        fi
     } > "${dir}/ups.conf"
 
     {
@@ -454,7 +482,7 @@ RUN_AS_USER nut
 MONITOR ${UPS_NAME}@localhost 1 proxmoxmon ${PRIMARY_PASS} ${UPSMON_ROLE}
 
 MINSUPPLIES 1
-SHUTDOWNCMD "$(command -v shutdown) -h now"
+SHUTDOWNCMD "$([[ "${POWERCYCLE_ENABLED}" == "1" ]] && echo "${INSTALL_DIR}/qtronic-shutdown-wrapper.sh" || echo "$(command -v shutdown) -h now")"
 NOTIFYCMD $(command -v upssched)
 
 POLLFREQ ${POLLFREQ}
@@ -539,7 +567,17 @@ apply_current() {
 
     local previous_monitor backup tmp result status
     previous_monitor="$(systemctl is-active nut-monitor.service 2>/dev/null || true)"
+
+    if [[ "${POWERCYCLE_ENABLED}" == "1" ]]; then
+        powercycle_probe 1 || die "Aktywny power-cycle nie przechodzi capability gate. Nie zmieniam konfiguracji."
+    fi
+
     backup="$(backup_now)"
+
+    if [[ "${POWERCYCLE_ENABLED}" == "1" ]]; then
+        install_powercycle_runtime
+    fi
+
     tmp="$(mktemp -d /tmp/qtronic-nut-config.XXXXXX)"
 
     render_temp "${tmp}"
@@ -764,6 +802,32 @@ install_self() {
     install_status_helper
     install_ha_helper
 
+    # Zachowana funkcja power-cycle nie jest ślepo odtwarzana.
+    # Najpierw aktualny sprzęt musi ponownie przejść probe.
+    if [[ "${POWERCYCLE_ENABLED:-0}" == "1" ]]; then
+        current_status="$(status_now || true)"
+
+        if printf '%s
+' "${current_status}" | grep -qw OL            && ! printf '%s
+' "${current_status}" | grep -qw OB; then
+            if powercycle_probe 1; then
+                install_powercycle_runtime
+            else
+                warn "Zapisany power-cycle nie przechodzi capability gate na aktualnym sprzęcie."
+                warn "Pozostawiam ustawienie zapisane, ale nie uzbrajam runtime."
+                warn "Sprawdź: nut-config powercycle probe"
+                remove_powercycle_runtime
+            fi
+        else
+            warn "Nie weryfikuję power-cycle podczas statusu ${current_status:-brak}."
+            warn "Ustawienie pozostaje zapisane, ale runtime nie jest teraz uzbrajany."
+            warn "Po stabilnym OL uruchom: nut-config apply"
+            remove_powercycle_runtime
+        fi
+    else
+        remove_powercycle_runtime
+    fi
+
     # Przy aktualizacji główny setup mógł na chwilę przywrócić wartości domyślne.
     # Jeśli UPS jest stabilnie OL, nakładamy zachowane ustawienia.
     if (( had_settings == 1 )); then
@@ -828,6 +892,11 @@ Logi:
   rotate size:         ${LOG_ROTATE_SIZE}
   rotate count:        ${LOG_ROTATE_COUNT}
 
+Power-cycle:
+  enabled:             $([[ "${POWERCYCLE_ENABLED}" == "1" ]] && echo TAK || echo NIE)
+  offdelay:            ${POWERCYCLE_OFFDELAY} s
+  ondelay:             ${POWERCYCLE_ONDELAY} s
+
 Usługi:
   nut-server:          $(systemctl is-active nut-server.service 2>/dev/null || true)
   nut-monitor:         $(systemctl is-active nut-monitor.service 2>/dev/null || true)
@@ -866,6 +935,9 @@ set_key() {
             ;;
         POLLFREQ|POLLFREQALERT|HOSTSYNC|DEADTIME|FINALDELAY|RBWARNTIME|NOCOMMWARNTIME|LOG_ROTATE_COUNT)
             printf -v "${key}" '%s' "${value}"
+            ;;
+        POWERCYCLE_ENABLED|POWERCYCLE_OFFDELAY|POWERCYCLE_ONDELAY)
+            die "Użyj dedykowanej bramki: nut-config powercycle ..."
             ;;
         LOG_ROTATE_SIZE)
             LOG_ROTATE_SIZE="${value}"
@@ -1057,6 +1129,355 @@ rotate_credential() {
     ok "Hasło ${which} zmienione. Backup: ${backup}"
 }
 
+
+# ------------------------------------------------------------------------------
+# Guarded power-cycle UPS
+# ------------------------------------------------------------------------------
+
+CAPABILITY_FILE="/etc/nut/qtronic-powercycle-capability.json"
+POWERCYCLE_FLAG="/etc/nut/qtronic-powercycle-fsd-ok"
+CUSTOM_HOOK_NAME="qtronic-nut-powercycle"
+
+powercycle_fingerprint() {
+    local raw="$1"
+    printf '%s\n' "${raw}" |
+        grep -E '^(device\.mfr|device\.model|device\.serial|ups\.mfr|ups\.model|ups\.serial|ups\.vendorid|ups\.productid|driver\.name|driver\.version\.data):' |
+        sort |
+        sha256sum |
+        awk '{print $1}'
+}
+
+powercycle_probe() {
+    local quiet="${1:-0}"
+    load_settings
+
+    local raw cmds rw status fp driver_name vendorid productid
+    local has_return=0 has_start=0 has_shutdown=0 has_off_delay=0 has_on_delay=0
+    local supported=0
+
+    raw="$(upsc "$(local_target)" 2>&1 || true)"
+    status="$(printf '%s\n' "${raw}" | sed -n 's/^ups.status: //p' | head -n1)"
+
+    if [[ -z "${status}" ]]; then
+        [[ "${quiet}" == "1" ]] || echo "[NIE] Brak odpowiedzi upsc."
+        return 1
+    fi
+
+    if ! printf '%s\n' "${status}" | grep -qw OL || printf '%s\n' "${status}" | grep -qw OB; then
+        [[ "${quiet}" == "1" ]] || echo "[NIE] Probe wymaga stabilnego OL. Aktualnie: ${status}"
+        return 1
+    fi
+
+    cmds="$(upscmd -l "$(local_target)" 2>&1 || true)"
+    rw="$(upsrw "$(local_target)" 2>&1 || true)"
+
+    printf '%s\n' "${cmds}" | grep -Eq '^shutdown\.return([[:space:]]|$)' && has_return=1
+    printf '%s\n' "${rw}" | grep -Eq '^\[ups\.delay\.start\]' && has_start=1
+    printf '%s\n' "${rw}" | grep -Eq '^\[ups\.delay\.shutdown\]' && has_shutdown=1
+    printf '%s\n' "${cmds}" | grep -Eq '^load\.off\.delay([[:space:]]|$)' && has_off_delay=1
+    printf '%s\n' "${cmds}" | grep -Eq '^load\.on\.delay([[:space:]]|$)' && has_on_delay=1
+
+    driver_name="$(printf '%s\n' "${raw}" | sed -n 's/^driver.name: //p' | head -n1)"
+    vendorid="$(printf '%s\n' "${raw}" | sed -n 's/^ups.vendorid: //p' | head -n1)"
+    productid="$(printf '%s\n' "${raw}" | sed -n 's/^ups.productid: //p' | head -n1)"
+    fp="$(powercycle_fingerprint "${raw}")"
+
+    if [[ "${has_return}" == "1" ]] \
+       && [[ -n "${driver_name}" ]] \
+       && command -v upsdrvctl >/dev/null 2>&1 \
+       && command -v systemctl >/dev/null 2>&1; then
+        supported=1
+    fi
+
+    python3 - "${CAPABILITY_FILE}" \
+        "${fp}" "${status}" "${driver_name}" "${vendorid}" "${productid}" \
+        "${has_return}" "${has_start}" "${has_shutdown}" \
+        "${has_off_delay}" "${has_on_delay}" "${supported}" <<'PY'
+import json, os, sys
+(
+    path, fp, status, driver_name, vendorid, productid,
+    shutdown_return, delay_start, delay_shutdown,
+    load_off_delay, load_on_delay, supported
+) = sys.argv[1:]
+
+data = {
+    "fingerprint": fp,
+    "status": status,
+    "driver_name": driver_name,
+    "vendorid": vendorid,
+    "productid": productid,
+    "shutdown_return": shutdown_return == "1",
+    "ups_delay_start_rw": delay_start == "1",
+    "ups_delay_shutdown_rw": delay_shutdown == "1",
+    "load_off_delay": load_off_delay == "1",
+    "load_on_delay": load_on_delay == "1",
+    "supported": supported == "1",
+}
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+os.chmod(tmp, 0o640)
+os.replace(tmp, path)
+PY
+    chown root:nut "${CAPABILITY_FILE}" 2>/dev/null || true
+
+    if [[ "${quiet}" != "1" ]]; then
+        echo "============================================================"
+        echo " Q-Tronic | power-cycle probe"
+        echo "============================================================"
+        echo "ups.status:              ${status}"
+        echo "driver.name:             ${driver_name:-brak}"
+        echo "USB VID:                 ${vendorid:-brak}"
+        echo "USB PID:                 ${productid:-brak}"
+        echo "fingerprint:             ${fp}"
+        echo "shutdown.return:         $([[ "${has_return}" == "1" ]] && echo TAK || echo NIE)"
+        echo "ups.delay.start R/W:     $([[ "${has_start}" == "1" ]] && echo TAK || echo NIE)"
+        echo "ups.delay.shutdown R/W:  $([[ "${has_shutdown}" == "1" ]] && echo TAK || echo NIE)"
+        echo "load.off.delay:          $([[ "${has_off_delay}" == "1" ]] && echo TAK || echo NIE)"
+        echo "load.on.delay:           $([[ "${has_on_delay}" == "1" ]] && echo TAK || echo NIE)"
+        echo "upsdrvctl:               $(command -v upsdrvctl || echo BRAK)"
+        echo "------------------------------------------------------------"
+        if [[ "${supported}" == "1" ]]; then
+            echo "WYNIK: POWER-CYCLE MOŻE ZOSTAĆ ODBLOKOWANY."
+            echo "Następny krok: nut-config powercycle enable"
+        else
+            echo "WYNIK: POWER-CYCLE POZOSTAJE ZABLOKOWANY."
+        fi
+        echo "============================================================"
+    fi
+
+    [[ "${supported}" == "1" ]]
+}
+
+install_powercycle_runtime() {
+    local hookdir hook upsdrvctl_bin logger_bin
+
+    # Wrapper wywoływany przez upsmon w momencie prawdziwego FSD.
+    # Jeszcze raz sprawdza fingerprint i shutdown.return. Dopiero wtedy
+    # tworzy prywatny Q-Tronic flag dla bardzo późnego hooka systemd.
+    cat > "${INSTALL_DIR}/qtronic-shutdown-wrapper.sh" <<'EOF_WRAP'
+#!/usr/bin/env bash
+set -u
+
+SETTINGS="/etc/nut/qtronic-settings.env"
+CAP="/etc/nut/qtronic-powercycle-capability.json"
+FLAG="/etc/nut/qtronic-powercycle-fsd-ok"
+
+[[ -r "${SETTINGS}" ]] && source "${SETTINGS}"
+
+rm -f "${FLAG}" 2>/dev/null || true
+
+if [[ "${POWERCYCLE_ENABLED:-0}" == "1" && -r "${CAP}" ]]; then
+    RAW="$(upsc "${UPS_NAME:-powerwalker}@localhost" 2>/dev/null || true)"
+    CMDS="$(upscmd -l "${UPS_NAME:-powerwalker}@localhost" 2>/dev/null || true)"
+
+    CURRENT_FP="$(
+        printf '%s\n' "${RAW}" |
+            grep -E '^(device\.mfr|device\.model|device\.serial|ups\.mfr|ups\.model|ups\.serial|ups\.vendorid|ups\.productid|driver\.name|driver\.version\.data):' |
+            sort |
+            sha256sum |
+            awk '{print $1}'
+    )"
+
+    EXPECTED_FP="$(jq -r '.fingerprint // empty' "${CAP}" 2>/dev/null || true)"
+    SUPPORTED="$(jq -r '.supported // false' "${CAP}" 2>/dev/null || true)"
+
+    if [[ "${SUPPORTED}" == "true" \
+       && -n "${EXPECTED_FP}" \
+       && "${CURRENT_FP}" == "${EXPECTED_FP}" ]] \
+       && printf '%s\n' "${CMDS}" | grep -Eq '^shutdown\.return([[:space:]]|$)'; then
+        {
+            echo "fingerprint=${CURRENT_FP}"
+            echo "created=$(date -Is)"
+        } > "${FLAG}.tmp"
+        chown root:root "${FLAG}.tmp"
+        chmod 0600 "${FLAG}.tmp"
+        mv -f "${FLAG}.tmp" "${FLAG}"
+        logger -t Q-Tronic-NUT "FSD: capability gate OK; późny power-cycle uzbrojony." || true
+    else
+        logger -t Q-Tronic-NUT "FSD: capability gate NIE przeszedł; shutdown bez power-cycle." || true
+    fi
+fi
+
+exec "$(command -v shutdown)" -h now
+EOF_WRAP
+    chown root:root "${INSTALL_DIR}/qtronic-shutdown-wrapper.sh"
+    chmod 0755 "${INSTALL_DIR}/qtronic-shutdown-wrapper.sh"
+
+    if [[ -d /usr/lib/systemd/system-shutdown ]]; then
+        hookdir="/usr/lib/systemd/system-shutdown"
+    elif [[ -d /lib/systemd/system-shutdown ]]; then
+        hookdir="/lib/systemd/system-shutdown"
+    else
+        hookdir="/usr/lib/systemd/system-shutdown"
+        mkdir -p "${hookdir}"
+    fi
+
+    hook="${hookdir}/${CUSTOM_HOOK_NAME}"
+    upsdrvctl_bin="$(command -v upsdrvctl)"
+    logger_bin="$(command -v logger || true)"
+
+    cat > "${hook}" <<EOF_HOOK
+#!/bin/sh
+# Q-Tronic: uruchamiane bardzo późno przez systemd-shutdown.
+# Bez prywatnego flagu stworzonego podczas prawdziwego FSD nic nie robi.
+
+SETTINGS="/etc/nut/qtronic-settings.env"
+FLAG="/etc/nut/qtronic-powercycle-fsd-ok"
+
+[ -r "\${SETTINGS}" ] || exit 0
+. "\${SETTINGS}"
+
+[ "\${POWERCYCLE_ENABLED:-0}" = "1" ] || exit 0
+[ -s "\${FLAG}" ] || exit 0
+
+${logger_bin:-/usr/bin/logger} -t Q-Tronic-NUT \
+    "Late shutdown: upsdrvctl shutdown \${UPS_NAME:-powerwalker}" 2>/dev/null || true
+
+export NUT_QUIET_INIT_NDE_WARNING=1
+${upsdrvctl_bin} shutdown "\${UPS_NAME:-powerwalker}" >/dev/null 2>&1 || true
+
+exit 0
+EOF_HOOK
+
+    chown root:root "${hook}"
+    chmod 0755 "${hook}"
+
+    # Stary flag nigdy nie może przeżyć normalnego startu systemu.
+    cat > /etc/systemd/system/qtronic-nut-powercycle-clear.service <<EOF_CLEAR
+[Unit]
+Description=Q-Tronic clear stale UPS power-cycle flag
+After=local-fs.target
+Before=nut-monitor.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/rm -f ${POWERCYCLE_FLAG}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF_CLEAR
+
+    systemctl daemon-reload
+    systemctl enable qtronic-nut-powercycle-clear.service >/dev/null 2>&1 || true
+    rm -f "${POWERCYCLE_FLAG}" 2>/dev/null || true
+}
+
+remove_powercycle_runtime() {
+    rm -f \
+        "${INSTALL_DIR}/qtronic-shutdown-wrapper.sh" \
+        /usr/lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} \
+        /lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} \
+        "${POWERCYCLE_FLAG}" \
+        2>/dev/null || true
+
+    systemctl disable qtronic-nut-powercycle-clear.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/qtronic-nut-powercycle-clear.service
+    systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+powercycle_status() {
+    load_settings
+
+    echo "============================================================"
+    echo " Q-Tronic | power-cycle status"
+    echo "============================================================"
+    echo "Enabled:           $([[ "${POWERCYCLE_ENABLED}" == "1" ]] && echo TAK || echo NIE)"
+    echo "OFF delay:         ${POWERCYCLE_OFFDELAY}s"
+    echo "ON delay:          ${POWERCYCLE_ONDELAY}s"
+    echo "Capability file:   $([[ -f "${CAPABILITY_FILE}" ]] && echo TAK || echo NIE)"
+    echo "FSD flag:          $([[ -f "${POWERCYCLE_FLAG}" ]] && echo UZBROJONY || echo nie)"
+    echo "Wrapper:           $([[ -x "${INSTALL_DIR}/qtronic-shutdown-wrapper.sh" ]] && echo TAK || echo NIE)"
+    echo "Late hook:         $([[ -x /usr/lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} || -x /lib/systemd/system-shutdown/${CUSTOM_HOOK_NAME} ]] && echo TAK || echo NIE)"
+    echo "------------------------------------------------------------"
+    powercycle_probe 0 || true
+}
+
+powercycle_enable() {
+    load_settings
+    load_creds
+    require_safe_change_window
+
+    echo "Sprawdzam konkretny aktualnie podłączony UPS..."
+    powercycle_probe 0 || die "Capability gate nie został spełniony."
+
+    local outer_backup detected_vid detected_pid
+    outer_backup="$(backup_now)"
+
+    # Jeżeli UPS raportuje VID/PID, wiążemy aktywną konfigurację właśnie z nimi.
+    detected_vid="$(jq -r '.vendorid // empty' "${CAPABILITY_FILE}")"
+    detected_pid="$(jq -r '.productid // empty' "${CAPABILITY_FILE}")"
+
+    if [[ "${detected_vid}" =~ ^[0-9A-Fa-f]{4}$ ]]; then
+        UPS_VENDORID="${detected_vid,,}"
+    fi
+    if [[ "${detected_pid}" =~ ^[0-9A-Fa-f]{4}$ ]]; then
+        UPS_PRODUCTID="${detected_pid,,}"
+    fi
+
+    POWERCYCLE_ENABLED=1
+    validate_settings
+    install_powercycle_runtime
+
+    if ! apply_current; then
+        warn "Nie udało się zastosować konfiguracji power-cycle."
+        restore_backup_dir "${outer_backup}"
+        remove_powercycle_runtime
+        return 1
+    fi
+
+    # Po restarcie sterownika jeszcze raz tylko odczytujemy capabilities.
+    if ! powercycle_probe 1; then
+        warn "Po przeładowaniu UPS nie przechodzi już capability gate."
+        restore_backup_dir "${outer_backup}"
+        remove_powercycle_runtime
+        return 2
+    fi
+
+    ok "Power-cycle WŁĄCZONY."
+    echo "OFF delay: ${POWERCYCLE_OFFDELAY}s"
+    echo "ON delay:  ${POWERCYCLE_ONDELAY}s"
+    echo
+    echo "Podczas konfiguracji NIE wykonano shutdown.return."
+    echo "Przed prawdziwym FSD wrapper ponownie sprawdzi fingerprint i shutdown.return."
+}
+
+powercycle_disable() {
+    load_settings
+    load_creds
+    require_safe_change_window
+
+    POWERCYCLE_ENABLED=0
+    apply_current
+    remove_powercycle_runtime
+
+    ok "Power-cycle WYŁĄCZONY."
+}
+
+powercycle_delays() {
+    [[ $# -eq 2 ]] || die "nut-config powercycle delays OFF_SECONDS ON_SECONDS"
+
+    load_settings
+    load_creds
+
+    POWERCYCLE_OFFDELAY="$1"
+    POWERCYCLE_ONDELAY="$2"
+    validate_settings
+
+    if [[ "${POWERCYCLE_ENABLED}" == "1" ]]; then
+        powercycle_probe 1 || die "Aktualny UPS nie przechodzi capability gate."
+        apply_current
+        powercycle_probe 1 || die "Po zmianie delay UPS nie przechodzi ponownego probe."
+    else
+        local backup
+        backup="$(backup_now)"
+        save_settings
+        ok "Delay zapisane. Zostaną użyte dopiero po bezpiecznym powercycle enable."
+        echo "Backup: ${backup}"
+    fi
+}
+
 mqtt_cmd() {
     local sub="${1:-status}"
     case "${sub}" in
@@ -1186,12 +1607,18 @@ Monitor:
   nut-config monitor enable
   nut-config monitor disable
 
+Power-cycle UPS:
+  nut-config powercycle probe
+  nut-config powercycle status
+  nut-config powercycle delays 60 300
+  nut-config powercycle enable
+  nut-config powercycle disable
+
 Backup/diagnostyka:
   nut-config backup
   nut-config rollback
   nut-config report
   nut-config capabilities
-  nut-config powercycle status
 
 Zasady bezpieczeństwa:
 - localhost:3493 pozostaje stałym wewnętrznym control-plane NUT.
@@ -1201,6 +1628,9 @@ Zasady bezpieczeństwa:
 - Po zmianie wymagane jest stabilne OL; inaczej następuje rollback.
 - UPS_NAME jest celowo stałym identyfikatorem logicznym.
 - Fizyczne odcinanie 230 V nie jest włączane automatycznie.
+- "powercycle enable" wymaga jawnego shutdown.return z bieżącego sprzętu.
+- Przy prawdziwym FSD sprzęt jest sprawdzany ponownie przed uzbrojeniem hooka.
+- Probe i enable NIE wykonują testowego shutdown.return.
 EOF_HELP
 }
 
@@ -1218,7 +1648,8 @@ menu() {
         echo "8) Home Assistant"
         echo "9) MQTT"
         echo "10) Monitor NUT"
-        echo "11) Raport"
+        echo "11) Power-cycle UPS"
+        echo "12) Raport"
         echo "0) Wyjście"
         read -r -p "Wybór: " choice
 
@@ -1233,7 +1664,26 @@ menu() {
             8) /usr/local/sbin/nut-ha-info ;;
             9) /usr/local/sbin/nut-mqtt-config ;;
             10) read -r -p "status/enable/disable: " v; monitor_cmd "${v}" ;;
-            11) /usr/local/sbin/nut-report ;;
+            11)
+                echo "a) probe"
+                echo "b) status"
+                echo "c) delays"
+                echo "d) enable"
+                echo "e) disable"
+                read -r -p "Wybór: " v
+                case "${v}" in
+                    a) powercycle_probe 0 ;;
+                    b) powercycle_status ;;
+                    c)
+                        read -r -p "OFF delay [s]: " d1
+                        read -r -p "ON delay [s]: " d2
+                        powercycle_delays "${d1}" "${d2}"
+                        ;;
+                    d) powercycle_enable ;;
+                    e) powercycle_disable ;;
+                esac
+                ;;
+            12) /usr/local/sbin/nut-report ;;
             0) exit 0 ;;
         esac
     done
@@ -1324,7 +1774,7 @@ case "${cmd}" in
         [[ $# -eq 1 ]] || die "nut-config get KLUCZ"
         key="$1"
         case "${key}" in
-            UPS_NAME|UPS_DESC|UPS_DRIVER|UPS_PORT|UPS_VENDORID|UPS_PRODUCTID|UPS_SUBDRIVER|NUT_LISTEN_IP|NUT_PORT|SHUTDOWN_DELAY|TIMED_SHUTDOWN|LOWBATT_SHUTDOWN|POLLFREQ|POLLFREQALERT|HOSTSYNC|DEADTIME|FINALDELAY|RBWARNTIME|NOCOMMWARNTIME|LOG_ROTATE_SIZE|LOG_ROTATE_COUNT|UPSMON_ROLE)
+            UPS_NAME|UPS_DESC|UPS_DRIVER|UPS_PORT|UPS_VENDORID|UPS_PRODUCTID|UPS_SUBDRIVER|NUT_LISTEN_IP|NUT_PORT|SHUTDOWN_DELAY|TIMED_SHUTDOWN|LOWBATT_SHUTDOWN|POLLFREQ|POLLFREQALERT|HOSTSYNC|DEADTIME|FINALDELAY|RBWARNTIME|NOCOMMWARNTIME|LOG_ROTATE_SIZE|LOG_ROTATE_COUNT|UPSMON_ROLE|POWERCYCLE_ENABLED|POWERCYCLE_OFFDELAY|POWERCYCLE_ONDELAY)
                 printf '%s\n' "${!key}"
                 ;;
             *)
@@ -1408,15 +1858,25 @@ case "${cmd}" in
         ;;
     powercycle)
         sub="${1:-status}"
+        shift || true
         case "${sub}" in
+            probe)
+                powercycle_probe 0
+                ;;
             status)
-                /usr/local/sbin/nut-phase2-check
-                echo
-                echo "Automatyczne włączanie power-cycle pozostaje zablokowane."
-                echo "Najpierw potwierdzamy możliwości konkretnej sztuki UPS."
+                powercycle_status
+                ;;
+            delays)
+                powercycle_delays "$@"
+                ;;
+            enable)
+                powercycle_enable
+                ;;
+            disable)
+                powercycle_disable
                 ;;
             *)
-                die "Obecnie dostępne: nut-config powercycle status"
+                die "nut-config powercycle probe|status|delays OFF ON|enable|disable"
                 ;;
         esac
         ;;
