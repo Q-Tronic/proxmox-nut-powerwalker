@@ -1025,7 +1025,9 @@ Przed przywróceniem zawsze powstaje **dodatkowy backup bezpieczeństwa**. Resto
 
 Jeżeli wybrany backup miał aktywny power-cycle, skrypt przygotowuje fail-closed runtime przed przywróceniem, a po restarcie **ponownie** sprawdza capabilities i świeży fingerprint UPS. Jeśli walidacja po restore nie przejdzie, skrypt próbuje wrócić do backupu bezpieczeństwa zamiast pozostawiać niezweryfikowany power-cycle.
 
-Backup formatu RC1 zapisuje też, czy opcjonalne pliki istniały oraz osobno stan `active/enabled` dla `nut-monitor`, MQTT i health-watchdoga. Restore usuwa plik, który w danym backupie był nieobecny, zamiast przypadkiem zostawić nowszą konfigurację. `nut-monitor` jest przywracany dopiero po ponownym potwierdzeniu stabilnego `OL`; błąd restartu, walidacji **lub odtworzenia stanu usług** nie kończy się fałszywym `[OK]`. Starsze backupy bez manifestu pozostają obsługiwane w trybie zgodnościowym.
+Backup formatu RC1 zapisuje też, czy opcjonalne pliki istniały oraz osobno stan `active/enabled` dla `nut-monitor`, MQTT i health-watchdoga. Restore usuwa opcjonalny plik, który w danym backupie był nieobecny, zamiast przypadkiem zostawić nowszą konfigurację. Wymagany plik oznaczony jako brakujący powoduje odmowę restore; manifest v2 akceptuje wyłącznie znane ścieżki i jednostki systemd. `nut-monitor` jest przywracany dopiero po ponownym potwierdzeniu stabilnego `OL`; błąd restartu, walidacji **lub odtworzenia stanu usług** nie kończy się fałszywym `[OK]`. Backup z power-cycle=ON musi posiadać własny capability fingerprint zgodny z aktualnym UPS. Starsze backupy bez manifestu pozostają obsługiwane w ograniczonym trybie zgodnościowym.
+
+Także zwykłe udane zmiany konfiguracji i rotacja haseł zachowują dokładny stan `active/enabled` `nut-monitor`, zamiast niejawnie zmieniać politykę startu usługi.
 
 ## `nut-config backup prune`
 
@@ -1289,6 +1291,8 @@ Jeżeli utworzysz techniczny tag `v1.0.0-rc1`, workflow GitHub oznaczy go automa
 Głównym urządzeniem docelowym jest **PowerWalker VI 2200 STL FR**. Projekt zna wariant USB `0764:0601`, ale nie zakłada, że każdy egzemplarz lub firmware będzie raportował identyczne możliwości.
 
 Fizyczny power-cycle zależy od tego, co faktycznie udostępnia konkretny UPS. Samo pojawienie się `shutdown.return` w liście możliwości nie jest dowodem, że firmware zachowa się prawidłowo fizycznie — dlatego pierwszy rzeczywisty test należy wykonać pod nadzorem.
+
+Fingerprint jest tak unikalny, jak dane udostępniane przez UPS/NUT. Jeżeli dwa identyczne egzemplarze nie raportują numeru seryjnego ani innego unikalnego pola, sam fingerprint nie potrafi kryptograficznie odróżnić tych dwóch sztuk; dlatego przy zamianie identycznego UPS-a power-cycle należy świadomie wyłączyć, wykonać probe i ponownie włączyć dopiero po kontroli sprzętu.
 
 
 ---

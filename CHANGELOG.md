@@ -10,7 +10,9 @@ Finalny kandydat przed testami na fizycznym PowerWalkerze.
 - `CANCEL-TIMER shutdown_on_battery` dostał fallback `timer_cancel_failed`; prowadzony test `OL -> OB -> OL` sprawdza logi i, gdy dostępne, `upssched -l`.
 - Operacje renderujące/restartujące konfigurację wymagają stabilnego `OL` niezależnie od stanu `nut-monitor`.
 - Backup v2 zapisuje obecność/brak plików i osobne stany `active/enabled` monitora, MQTT i health-watchdoga.
+- Udane zmiany konfiguracji i rotacja haseł zachowują dokładnie oba stany `active/enabled` `nut-monitor` (np. ręcznie uruchomiony, ale disabled, nie staje się przypadkiem enabled).
 - Restore fail-closed: błąd restartu/walidacji lub odtworzenia stanu usług propaguje się, monitor wraca tylko po potwierdzonym `OL`, a nieudany restore próbuje wrócić do backupu bezpieczeństwa.
+- Restore v2 waliduje whitelistę ścieżek/jednostek i kompletność manifestów; wymagany plik nie może być oznaczony jako nieobecny, a power-cycle z backupu wymaga capability fingerprintu zapisnego w tym samym backupie i zgodnego z aktualnym UPS.
 - Power-cycle rozróżnia stan skonfigurowany od faktycznie uzbrojonego runtime (`DISABLED` / `ARMED` / `PENDING_NOT_ARMED`). Aktualizacja bez możliwości świeżej walidacji utrwala `POWERCYCLE_ENABLED=0`.
 - `powercycle probe/status` nie nadpisuje już zapisanego capability fingerprintu; nowy fingerprint może zostać utrwalony wyłącznie podczas świadomego `powercycle enable`, więc samo sprawdzenie po podmianie UPS-a nie przepina autoryzacji.
 - Dodatkowa walidacja `UPS_NAME`, `UPS_PORT`, `UPS_SUBDRIVER`, opisu i `UPSMON_ROLE`.
