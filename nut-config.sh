@@ -1942,6 +1942,62 @@ NAJWAŻNIEJSZE ZASADY
   - Power-cycle jest domyślnie wyłączony i wymaga pozytywnego capability probe.
   - Probe i powercycle enable NIE wysyłają testowego shutdown.return.
 
+NARZĘDZIA INSTALOWANE PRZEZ PROJEKT
+  nut-status
+      Szybki stan UPS: model, ups.status, bateria, runtime, obciążenie, moc,
+      napięcia, BYPASS i stan usług. Tylko odczyt. W aktywnym BYPASS brak
+      komunikacji po fizycznym odłączeniu UPS jest pokazywany jako stan oczekiwany.
+
+  nut-watch
+      Odświeża nut-status co sekundę. Najwygodniejsze podczas testu OL -> OB -> OL.
+      Tylko odczyt. Wyjście: Ctrl+C.
+
+  nut-capabilities
+      Pokazuje pełne upsc, listę dostępnych komend upscmd -l oraz zmienne upsrw.
+      Samo wyświetlenie listy nie wykonuje żadnej komendy UPS. Tylko odczyt.
+
+  nut-phase2-check
+      Starszy pomocniczy test read-only możliwości związanych z power-cycle.
+      Do decyzji o uzbrojeniu używaj przede wszystkim: nut-config powercycle probe.
+
+  nut-logs 100
+      Pokazuje log zdarzeń NUT, MQTT i journal usług. Liczbę można zmienić,
+      np. nut-logs 300. Maksymalnie 500 linii. Tylko odczyt.
+
+  nut-test-guide
+      Wyświetla bezpieczną instrukcję pierwszego testu zaniku zasilania.
+      Niczego nie przełącza i nie wykonuje FSD. Tylko odczyt.
+
+  nut-restart
+      Restartuje stos NUT i ponownie sprawdza komunikację z UPS. Monitor zostaje
+      uzbrojony tylko przy stabilnym OL. W BYPASS komenda odmawia uzbrojenia
+      i kieruje do: nut-config resume.
+
+  nut-report
+      Generuje pełny raport diagnostyczny. Hasło MONITOR jest maskowane, ale raport
+      może zawierać IP, nazwę hosta, identyfikatory USB i numer seryjny UPS.
+      Przejrzyj raport przed publicznym udostępnieniem.
+
+  nut-ha-info
+      Pokazuje host, port, użytkownika, HASŁO Home Assistant i nazwę UPS.
+      Wyniku nie publikuj bez usunięcia hasła.
+
+  nut-mqtt-config
+      Interaktywny konfigurator MQTT. Testuje połączenie przed uruchomieniem usługi.
+      Jest blokowany w BYPASS. To samo uruchamia: nut-config mqtt setup.
+
+  nut-mqtt-disable
+      Zatrzymuje i wyłącza most MQTT, ale zachowuje jego plik konfiguracyjny.
+
+  nut-rollback
+      Przywraca ostatni backup wykonany przez GŁÓWNY INSTALATOR.
+      To nie jest to samo co "nut-config rollback", który cofa ostatnią zmianę
+      konfiguratora. nut-rollback jest blokowany w BYPASS.
+
+  nut-delay
+      Bez argumentu pokazuje SHUTDOWN_DELAY. Z argumentem ustawia go, np.
+      nut-delay 90, nut-delay 2m, nut-delay 1h. To wygodny alias do nut-config delay.
+
 SZYBKI START
   nut-config
   nut-config show
