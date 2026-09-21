@@ -187,6 +187,16 @@ if 'fingerprint power-cycle nie pasuje do aktualnego UPS' not in nut:
     raise SystemExit("watchdog current UPS fingerprint check missing")
 if 'Nie udało się odtworzyć stanu ${unit}' not in nut:
     raise SystemExit("restore service-state failure propagation missing")
+if 'Backup v2 jest niekompletny (brak manifestu).' not in nut or 'Nieoczekiwana ścieżka w manifeście backupu' not in nut:
+    raise SystemExit("backup v2 manifest validation missing")
+if 'Nieoczekiwana jednostka w manifeście backupu' not in nut or 'Manifest usług backupu v2 jest niekompletny lub zduplikowany.' not in nut:
+    raise SystemExit("backup v2 service manifest validation missing")
+if 'Backup ma power-cycle=ON, ale nie zawiera własnego capability fingerprintu.' not in nut:
+    raise SystemExit("power-cycle restore must require capability fingerprint from selected backup")
+if 'previous_monitor="$(systemctl is-active nut-monitor.service' in nut:
+    raise SystemExit("config changes must preserve monitor active/enabled separately")
+if nut.count('restore_service_state nut-monitor.service "${previous_monitor_active}" "${previous_monitor_enabled}"') < 2:
+    raise SystemExit("apply/credential rotation must restore exact monitor active/enabled state")
 if 'if bash "${PERSISTENT_INSTALLER}"; then' not in install:
     raise SystemExit("install.sh does not safely capture setup rc under set -e")
 if 'if bash "${PERSISTENT_CONFIG}" --install; then' not in install:
@@ -206,6 +216,8 @@ if "binary_sensor.powerwalker" in nut_ha:
     raise SystemExit("official NUT HA example contains MQTT entities")
 if "binary_sensor.powerwalker" not in mqtt_ha:
     raise SystemExit("MQTT HA example does not contain MQTT-discovered entities")
+if (root / "home-assistant" / "automations-example.yaml").read_text() != nut_ha:
+    raise SystemExit("automations-example.yaml must be exact compatibility copy of NUT example")
 
 # Public repo cleanup invariant.
 if (root / "GITHUB-MOBILE.md").exists():
