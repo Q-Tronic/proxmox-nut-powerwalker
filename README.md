@@ -5,7 +5,7 @@ Bezpieczna integracja UPS z **Proxmox VE** przy użyciu **Network UPS Tools (NUT
 Projekt jest przygotowany przede wszystkim dla **PowerWalker VI 2200 STL FR**. Może działać także z innymi UPS-ami USB HID obsługiwanymi przez NUT, ale dostępne dane i komendy zależą od modelu, firmware, wersji NUT i sterownika.
 
 Autor: **Q-Tronic**  
-Wersja projektu: **1.0.0-rc2** (`VERSION` w repo) — release candidate do testów na fizycznym UPS
+Wersja projektu: **1.0.0-rc3** (`VERSION` w repo) — release candidate do testów na fizycznym UPS
 
 ## Co ten projekt robi
 
@@ -1180,7 +1180,7 @@ Przykładowy wynik:
 
 ```text
 Q-Tronic Proxmox NUT PowerWalker
-Wersja lokalna: 1.0.0-rc2
+Wersja lokalna: 1.0.0-rc3
 Kanał update:   main
 Repo:           Q-Tronic/proxmox-nut-powerwalker
 ```
@@ -1281,11 +1281,11 @@ Ręczny bootstrap również jest blokowany podczas aktywnego BYPASS przez głów
 
 ---
 
-# Status wydania RC2
+# Status wydania RC3
 
-`1.0.0-rc2` jest kandydatem do pierwszego stabilnego wydania z finalnym hotfixem BYPASS i restore. Statyczne CI może sprawdzić składnię, ShellCheck, YAML i inwarianty projektu, ale **nie zastępuje testu konkretnego firmware UPS**. Taga `v1.0.0` nie twórz przed przejściem testów sprzętowych `OL -> OB -> OL`, pełnego shutdownu i — jeżeli zostanie użyty — kontrolowanego power-cycle.
+`1.0.0-rc3` jest kandydatem do pierwszego stabilnego wydania z poprawką wznowienia nieukończonej instalacji i pustego subdrivera. Statyczne CI może sprawdzić składnię, ShellCheck, YAML i inwarianty projektu, ale **nie zastępuje testu konkretnego firmware UPS**. Taga `v1.0.0` nie twórz przed przejściem testów sprzętowych `OL -> OB -> OL`, pełnego shutdownu i — jeżeli zostanie użyty — kontrolowanego power-cycle.
 
-Jeżeli utworzysz techniczny tag `v1.0.0-rc2`, workflow GitHub oznaczy go automatycznie jako **pre-release**. Kanał `stable` korzysta z `/releases/latest`, więc RC nie stanie się przypadkiem wydaniem stabilnym.
+Jeżeli utworzysz techniczny tag `v1.0.0-rc3`, workflow GitHub oznaczy go automatycznie jako **pre-release**. Kanał `stable` korzysta z `/releases/latest`, więc RC nie stanie się przypadkiem wydaniem stabilnym.
 
 
 # Zgodność

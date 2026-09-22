@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.0-rc3 — 2026-09-22
+
+- Instalator kończy poprawnie zapis `ups.conf` przy pustym opcjonalnym `subdriver`.
+- Wznowienie po przerwaniu RC2 przed zapisaniem `upsd.conf` omija preflight niedziałającego serwera; aktywny monitor nadal blokuje automatyczne wznowienie.
+- Wersja NUT jest odczytywana z zainstalowanego pakietu `nut-client`, z fallbackiem do `upsmon -V`.
+
+
 ## 1.0.0-rc2 — 2026-09-21
 
 Ostateczny hotfix bezpieczeństwa przed testami wydania.

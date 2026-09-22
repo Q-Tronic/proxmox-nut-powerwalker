@@ -110,6 +110,12 @@ chmod 0700 "${BASE_DIR}" "${BACKUP_ROOT}" "${REPORT_DIR}"
 # najpierw wymagamy działającej komunikacji i stabilnego OL. To jest preflight
 # PRZED backupem i PRZED jakąkolwiek zmianą /etc/nut.
 if [[ -f /etc/nut/ups.conf ]] && grep -Fq "${MARKER}" /etc/nut/ups.conf 2>/dev/null; then
+    # RC2 mogło przerwać instalację po zapisaniu ups.conf, przed upsd.conf.
+    # W takim stanie nie ma jeszcze serwera, na którym można wykonać preflight.
+    if [[ ! -f /etc/nut/upsd.conf ]] || ! grep -Fq "${MARKER}" /etc/nut/upsd.conf 2>/dev/null; then
+        systemctl is-active --quiet nut-monitor.service && die "Niekompletna konfiguracja Q-Tronic, ale nut-monitor jest aktywny. Zatrzymaj go i zbadaj stan przed wznowieniem."
+        warn "Wykryto niedokończoną instalację Q-Tronic; wznawiam bez preflight istniejącego NUT."
+    else
     EXISTING_UPSC_BIN="$(command -v upsc || true)"
     command -v timeout >/dev/null 2>&1 || die "Brak timeout; nie wykonuję bezpiecznej reinstalacji zarządzanej konfiguracji."
     [[ -n "${EXISTING_UPSC_BIN}" ]] || die "Istnieje konfiguracja Q-Tronic, ale brak upsc. Nie aktualizuję jej w ciemno."
@@ -136,6 +142,7 @@ if [[ -f /etc/nut/ups.conf ]] && grep -Fq "${MARKER}" /etc/nut/ups.conf 2>/dev/n
     printf '%s\n' "${EXISTING_STATUS}" | grep -qw OL || die "Aktualizacja/reinstalacja istniejącej konfiguracji Q-Tronic wymaga stabilnego OL. Status: ${EXISTING_STATUS}"
     ! printf '%s\n' "${EXISTING_STATUS}" | grep -qw OB || die "UPS raportuje OB. Nie aktualizuję/reinstaluję podczas pracy z baterii."
     ok "Preflight aktualizacji/reinstalacji: UPS ${EXISTING_UPS_NAME} odpowiada i jest stabilnie OL."
+    fi
 fi
 
 # mktemp eliminuje kolizję dwóch instalacji uruchomionych w tej samej sekundzie.
@@ -231,7 +238,8 @@ LOGGER_BIN="$(command -v logger)"
 PYTHON_BIN="$(command -v python3)"
 JQ_BIN="$(command -v jq)"
 
-NUT_VERSION="$("${UPSMON_BIN}" -V 2>&1 | grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)"
+NUT_VERSION="$(dpkg-query -W -f='${Version}' nut-client 2>/dev/null | sed -nE 's/^([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/p' || true)"
+[[ -n "${NUT_VERSION}" ]] || NUT_VERSION="$("${UPSMON_BIN}" -V 2>&1 | grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 || true)"
 [[ -n "${NUT_VERSION}" ]] || NUT_VERSION="unknown"
 
 if [[ "${NUT_VERSION}" != "unknown" ]] && dpkg --compare-versions "${NUT_VERSION}" ge "2.8.0"; then
@@ -529,7 +537,7 @@ EOF
     echo "    desc = \"${UPS_DESC}\""
     [[ -n "${VENDORID}" ]] && echo "    vendorid = ${VENDORID}"
     [[ -n "${PRODUCTID}" ]] && echo "    productid = ${PRODUCTID}"
-    [[ -n "${SUBDRIVER}" ]] && echo "    subdriver = ${SUBDRIVER}"
+    if [[ -n "${SUBDRIVER}" ]]; then echo "    subdriver = ${SUBDRIVER}"; fi
 } | atomic_install /etc/nut/ups.conf root nut 0640
 
 if [[ -n "${PVE_IP}" && "${PVE_IP}" != "127.0.0.1" ]]; then

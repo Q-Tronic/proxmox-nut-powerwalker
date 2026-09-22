@@ -2,6 +2,7 @@
 from pathlib import Path
 import ast
 import re
+import subprocess
 import yaml
 
 root = Path(__file__).resolve().parents[1]
@@ -156,6 +157,22 @@ for rel in ["nut-config.sh", "setup-nut-powerwalker-proxmox.sh"]:
 # RC1 safety/correctness invariants.
 setup = (root / "setup-nut-powerwalker-proxmox.sh").read_text()
 install = (root / "install.sh").read_text()
+
+# Exercise the exact ups.conf writer with and without an optional subdriver.
+writer = re.search(r'(\{\n    echo "\$\{MARKER\}"\n    echo "\[\$\{UPS_NAME\}\]".*?\n\} \| atomic_install /etc/nut/ups.conf root nut 0640)', setup, re.S)
+if writer is None:
+    raise SystemExit("ups.conf writer missing")
+for subdriver in ("", "CyberPower HID"):
+    prefix = "atomic_install() { cat; }\nMARKER='# test' UPS_NAME=test DRIVER=usbhid-ups PORT=auto UPS_DESC=test VENDORID=0764 PRODUCTID=0601 SUBDRIVER="
+    process = subprocess.run(
+        ["bash", "-euo", "pipefail", "-c", prefix + repr(subdriver) + "\n" + writer.group(1)],
+        capture_output=True, text=True,
+    )
+    if process.returncode or ("subdriver = " in process.stdout) != bool(subdriver):
+        raise SystemExit(f"ups.conf writer failed with optional subdriver={subdriver!r}: {process.stderr}")
+
+if 'Wykryto niedokończoną instalację Q-Tronic' not in setup or 'systemctl is-active --quiet nut-monitor.service && die' not in setup:
+    raise SystemExit("incomplete RC2 recovery guard missing")
 
 for rel, text in [("nut-config.sh", nut), ("setup-nut-powerwalker-proxmox.sh", setup)]:
     if "EXECUTE emergency_shutdown" in text or "EMERGENCY: LOWBATT" in text:
